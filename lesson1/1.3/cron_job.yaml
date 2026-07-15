@@ -1,0 +1,24 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: report-generator
+spec:
+  schedule: "*/1 * * * *"       # Every minute (min hour dom month dow)
+  concurrencyPolicy: Forbid     # Skip new run if previous still active
+  successfulJobsHistoryLimit: 3 # Keep last 3 successful Jobs
+  failedJobsHistoryLimit: 1     # Keep last 1 failed Job
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        spec:
+          containers:
+          - name: report-generator
+            image: busybox:musl
+            command:
+            - /bin/sh
+            - -c
+            - |
+              date
+              echo "Generating report..."
+          restartPolicy: OnFailure

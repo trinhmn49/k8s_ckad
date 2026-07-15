@@ -1,0 +1,26 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: data-processor
+spec:
+  backoffLimit: 3          # Retry up to 3 times on failure before giving up
+  template:
+    spec:
+      containers:
+      - name: data-processor
+        image: busybox:musl
+        command:
+        - /bin/sh
+        - -c
+        - |
+          echo "Processing data..."
+          sleep 5
+          echo "Done"
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 200m
+            memory: 128Mi
+      restartPolicy: Never   # Never or OnFailure required for Jobs

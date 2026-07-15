@@ -1,0 +1,13 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: always-fails
+spec:
+  backoffLimit: 2           # Only 2 retries -> fails fast for demo purposes
+  template:
+    spec:
+      containers:
+      - name: always-fails
+        image: busybox:musl
+        command: ["/bin/sh", "-c", "echo 'about to fail'; exit 1"]
+      restartPolicy: Never
