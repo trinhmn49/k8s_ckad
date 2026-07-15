@@ -1,0 +1,235 @@
+Lab 1.2 — Init + Sidecar Pattern
+Duration: ~60 min | CKAD domain: Application Design and Build (20%)
+Build a multi-container Pod with init container, app container, and sidecar
+Share data via emptyDir volume
+Tail application logs from sidecar using kubectl logs -c
+
+# ============================================================================
+# DETAILED EXPLANATION
+# ============================================================================
+# 
+# THE PATTERN HAS 3 CONTAINER ROLES:
+#
+# 1. INIT CONTAINER (runs-to-completion BEFORE app starts)
+#    - Prepares the shared volume with initial data
+#    - Sets up configuration files or scripts
+#    - Runs once at Pod startup, then terminates successfully
+#    - Pod waits for init container to complete before starting app containers
+#    - Use case: Download configs, validate prerequisites, prepare shared storage
+#
+# 2. APP CONTAINER (main application)
+#    - The primary application serving requests
+#    - Reads/writes to the shared emptyDir volume
+#    - Runs continuously unless explicitly stopped
+#    - Logs its operations to the shared volume
+#    - Use case: Web server, API, main business logic
+#
+# 3. SIDECAR CONTAINER (runs alongside app)
+#    - Monitoring or auxiliary service running in parallel with app
+#    - Tails logs from the shared volume and processes them
+#    - Can monitor, transform, forward, or aggregate data
+#    - Shares the same lifecycle as the app container
+#    - Use case: Log shipper, monitoring agent, data transformer
+#
+# SHARED VOLUME (emptyDir):
+#    - Created when Pod starts, destroyed when Pod terminates
+#    - Mounted in all containers at the same path
+#    - Allows inter-container communication via files
+#    - Data persists for the Pod's lifetime but not beyond
+#
+# ============================================================================
+
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: multi-container-app
+  labels:
+    app: demo
+    pattern: init-sidecar
+spec:
+  # Volume shared by all containers
+  volumes:
+  - name: shared-data
+    emptyDir: {}  # Created/destroyed with Pod lifecycle
+
+  # INIT CONTAINER: Runs first, prepares shared volume
+  initContainers:
+  - name: init-setup
+    image: busybox:latest
+    command: 
+      - /bin/sh
+      - -c
+      - |
+        echo "=== INIT CONTAINER RUNNING ===" > /shared/app.log
+        echo "Initializing shared volume..." >> /shared/app.log
+        echo "Timestamp: $(date)" >> /shared/app.log
+        echo "Init container completed successfully" >> /shared/app.log
+        sleep 2
+    volumeMounts:
+    - name: shared-data
+      mountPath: /shared
+    # After init completes successfully, app containers start
+
+  # MAIN APPLICATION CONTAINER
+  containers:
+  - name: app
+    image: nginx:alpine
+    ports:
+    - containerPort: 8080
+    volumeMounts:
+    - name: shared-data
+      mountPath: /shared
+    # App writes logs to shared volume
+    lifecycle:
+      postStart:
+        exec:
+          command: 
+            - /bin/sh
+            - -c
+            - |
+              echo "" >> /shared/app.log
+              echo "=== APP CONTAINER STARTED ===" >> /shared/app.log
+              echo "App serving on port 8080" >> /shared/app.log
+              echo "Timestamp: $(date)" >> /shared/app.log
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 256Mi
+
+  # SIDECAR CONTAINER: Tails and processes logs
+  - name: log-sidecar
+    image: busybox:latest
+    command:
+      - /bin/sh
+      - -c
+      - |
+        # Tail the app.log file continuously
+        tail -f /shared/app.log
+    volumeMounts:
+    - name: shared-data
+      mountPath: /shared
+    # No resource limits for tail (monitoring process)
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: 200m
+        memory: 128Mi
+
+  restartPolicy: Always
+  dnsPolicy: ClusterFirst
+
+# ============================================================================
+# STEP 1: CREATE THE POD
+# ============================================================================
+
+# Apply the manifest:
+kubectl apply -f lab_1.2.yaml
+
+# Check Pod creation:
+kubectl get pod multi-container-app
+
+# Watch the init container run:
+kubectl get pod multi-container-app -w
+
+# ============================================================================
+# STEP 2: VERIFY INIT CONTAINER COMPLETED
+# ============================================================================
+
+# Check Pod events (shows init container execution):
+kubectl describe pod multi-container-app
+
+# Expected output shows:
+#   - Init container completed
+#   - All app containers started
+#   - No restart loops
+
+# ============================================================================
+# STEP 3: VIEW LOGS FROM EACH CONTAINER
+# ============================================================================
+
+# View logs from init container (one-time execution):
+kubectl logs multi-container-app -c init-setup
+# Output: Shows initialization messages
+
+# View logs from app container:
+kubectl logs multi-container-app -c app
+# Output: App startup messages (sparse, nginx mostly silent)
+
+# View logs from sidecar container (tailing app.log):
+kubectl logs multi-container-app -c log-sidecar
+# Output: All messages from shared/app.log in real-time
+
+# ============================================================================
+# STEP 4: EXAMINE SHARED VOLUME CONTENTS
+# ============================================================================
+
+# Shell into app container:
+kubectl exec -it multi-container-app -c app -- /bin/sh
+
+# Inside the container, check shared volume:
+cat /shared/app.log
+# Shows all messages written by init and app
+
+# Exit the shell:
+exit
+
+# ============================================================================
+# STEP 5: VERIFY DATA SHARING BETWEEN CONTAINERS
+# ============================================================================
+
+# Execute command to append to log from app container:
+kubectl exec multi-container-app -c app -- \
+  sh -c "echo 'Message from app container' >> /shared/app.log"
+
+# View updated logs from sidecar:
+kubectl logs multi-container-app -c log-sidecar --tail=5
+# Shows the newly appended message
+
+# ============================================================================
+# KEY CONCEPTS FOR CKAD EXAM
+# ============================================================================
+
+# 1. INIT CONTAINER:
+#    - Defined under spec.initContainers (plural!)
+#    - Runs sequentially before regular containers
+#    - If init fails, Pod enters CrashLoopBackOff
+#    - Use for: setup, validation, preparation
+
+# 2. EMPTYDIR VOLUME:
+#    - Storage tied to Pod lifecycle
+#    - Mounts to same path in all containers
+#    - Perfect for inter-container communication
+#    - Lost when Pod is deleted
+
+# 3. SIDECAR PATTERN:
+#    - Secondary container running alongside primary
+#    - Shares Pod's network namespace (can reach localhost)
+#    - Common uses: logging, monitoring, proxying
+
+# 4. LOGGING STRATEGY:
+#    - Use kubectl logs -c <container> to view specific container
+#    - Use kubectl logs <pod> to view primary container
+#    - Sidecars often handle log aggregation
+
+# ============================================================================
+# TROUBLESHOOTING
+# ============================================================================
+
+# If Pod stuck in Init:0/1 or Init:1/3:
+# - Check init container logs: kubectl logs <pod> -c <init-container>
+# - Describe pod for error messages: kubectl describe pod <pod>
+
+# If containers can't see shared volume:
+# - Verify volume mounts exist: kubectl get pod <pod> -o yaml | grep -A5 volumeMounts
+# - Check volume definition: kubectl get pod <pod> -o yaml | grep -A5 volumes
+
+# If sidecar not getting logs:
+# - Verify file permissions in shared volume
+# - Check if app is actually writing to the file
+# - Use kubectl exec to check contents directly

@@ -1,0 +1,97 @@
+# Lab 1.1 — The 60-Second Pod
+# Duration: ~45 min | CKAD domain: Application Design and Build (20%)
+# Create a Pod imperatively with labels, environment variables, and resource requests/limits
+# Export a manifest using --dry-run=client -o yaml
+# Verify Pod state without opening an editor (exam speed path)
+
+# ============================================================================
+# SOLUTION
+# ============================================================================
+
+# STEP 1: Create Pod imperatively with all required specifications
+# Command to run:
+kubectl run web-server \
+  --image=nginx:alpine \
+  --labels="app=web,tier=frontend" \
+  --env="APP_ENV=production,LOG_LEVEL=info" \
+  --requests="cpu=100m,memory=128Mi" \
+  --limits="cpu=500m,memory=256Mi" \
+  --port=80 \
+  -n default
+
+# ============================================================================
+# STEP 2: Export the Pod manifest (dry-run for reference)
+# This shows what was created:
+kubectl run web-server \
+  --image=nginx:alpine \
+  --labels="app=web,tier=frontend" \
+  --env="APP_ENV=production,LOG_LEVEL=info" \
+  --requests="cpu=100m,memory=128Mi" \
+  --limits="cpu=500m,memory=256Mi" \
+  --port=80 \
+  --dry-run=client \
+  -o yaml
+
+# ============================================================================
+# STEP 3: Exported YAML Manifest (for reference)
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  creationTimestamp: null
+  labels:
+    app: web
+    tier: frontend
+  name: web-server
+  namespace: default
+spec:
+  containers:
+  - env:
+    - name: APP_ENV
+      value: production
+    - name: LOG_LEVEL
+      value: info
+    image: nginx:alpine
+    imagePullPolicy: IfNotPresent
+    name: web-server
+    ports:
+    - containerPort: 80
+      protocol: TCP
+    resources:
+      limits:
+        cpu: 500m
+        memory: 256Mi
+      requests:
+        cpu: 100m
+        memory: 128Mi
+  dnsPolicy: ClusterFirst
+  restartPolicy: Always
+status: {}
+
+# ============================================================================
+# STEP 4: Verification commands (no editor needed)
+
+# Get Pod details:
+kubectl get pod web-server -o wide
+
+# Check Pod status and events:
+kubectl describe pod web-server
+
+# Verify labels:
+kubectl get pod web-server -o jsonpath='{.metadata.labels}'
+
+# Verify environment variables:
+kubectl exec web-server -- printenv | grep -E "APP_ENV|LOG_LEVEL"
+
+# Verify resource requests/limits:
+kubectl get pod web-server -o jsonpath='{.spec.containers[0].resources}'
+
+# Check if Pod is running:
+kubectl get pod web-server -o jsonpath='{.status.phase}'
+
+# ============================================================================
+# EXAM TIPS:
+# - Use --dry-run=client -o yaml to preview before creating
+# - Combine all flags in one command for speed
+# - Use -o jsonpath for quick verification without opening editor
+# - Labels are crucial for workload selection in CKAD
