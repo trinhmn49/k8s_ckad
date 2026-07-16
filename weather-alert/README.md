@@ -1,0 +1,1 @@
+1. This project follow with "The Twelve Factors - "https://www.12factor.net/"
