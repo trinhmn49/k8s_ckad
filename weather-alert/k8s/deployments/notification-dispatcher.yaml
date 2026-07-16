@@ -1,0 +1,79 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: notification-dispatcher
+  namespace: weather-alert
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: notification-dispatcher
+  template:
+    metadata:
+      labels:
+        app: notification-dispatcher
+    spec:
+      containers:
+        - name: notification-dispatcher
+          image: weather-alert/notification-dispatcher:latest
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 8004
+          env:
+            - name: PORT
+              value: "8004"
+            - name: DB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: app-secrets
+                  key: DB_USER
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: app-secrets
+                  key: DB_PASSWORD
+            - name: APNS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: app-secrets
+                  key: APNS_KEY_ID
+            - name: APNS_TEAM_ID
+              valueFrom:
+                secretKeyRef:
+                  name: app-secrets
+                  key: APNS_TEAM_ID
+          envFrom:
+            - configMapRef:
+                name: app-config
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8004
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8004
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: notification-dispatcher
+  namespace: weather-alert
+spec:
+  selector:
+    app: notification-dispatcher
+  ports:
+    - port: 8004
+      targetPort: 8004
+  type: ClusterIP

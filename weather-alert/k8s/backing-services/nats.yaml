@@ -1,0 +1,56 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nats
+  namespace: weather-alert
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nats
+  template:
+    metadata:
+      labels:
+        app: nats
+    spec:
+      containers:
+        - name: nats
+          image: nats:2.10-alpine
+          args: ["-js", "-sd", "/data", "-m", "8222"]
+          ports:
+            - containerPort: 4222
+              name: client
+            - containerPort: 6222
+              name: cluster
+            - containerPort: 8222
+              name: monitor
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8222
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nats
+  namespace: weather-alert
+spec:
+  selector:
+    app: nats
+  ports:
+    - name: client
+      port: 4222
+      targetPort: 4222
+    - name: monitor
+      port: 8222
+      targetPort: 8222
+  type: ClusterIP

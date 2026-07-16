@@ -1,0 +1,64 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: weather-fetcher
+  namespace: weather-alert
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: weather-fetcher
+  template:
+    metadata:
+      labels:
+        app: weather-fetcher
+    spec:
+      containers:
+        - name: weather-fetcher
+          image: weather-alert/weather-fetcher:latest
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 8002
+          env:
+            - name: PORT
+              value: "8002"
+            - name: WEATHER_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: app-secrets
+                  key: WEATHER_API_KEY
+          envFrom:
+            - configMapRef:
+                name: app-config
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8002
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8002
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: weather-fetcher
+  namespace: weather-alert
+spec:
+  selector:
+    app: weather-fetcher
+  ports:
+    - port: 8002
+      targetPort: 8002
+  type: ClusterIP

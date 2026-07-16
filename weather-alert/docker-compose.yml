@@ -1,0 +1,176 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: weather-alert-postgres
+    environment:
+      POSTGRES_USER: weather_app
+      POSTGRES_PASSWORD: weather_app
+      POSTGRES_DB: weather_alert
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/schema.sql:/docker-entrypoint-initdb.d/schema.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U weather_app"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - weather-alert-net
+
+  redis:
+    image: redis:7-alpine
+    container_name: weather-alert-redis
+    command: redis-server --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - weather-alert-net
+
+  nats:
+    image: nats:2.10-alpine
+    container_name: weather-alert-nats
+    ports:
+      - "4222:4222"
+      - "6222:6222"
+      - "8222:8222"
+    command: -js -sd /data -m 8222
+    volumes:
+      - nats_data:/data
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8222/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - weather-alert-net
+
+  user-service:
+    build:
+      context: .
+      dockerfile: user-service/Dockerfile
+    container_name: weather-alert-user-service
+    environment:
+      PORT: 8001
+      LOG_LEVEL: info
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: weather_app
+      DB_PASSWORD: weather_app
+      DB_NAME: weather_alert
+      NATS_URL: nats://nats:4222
+    ports:
+      - "8001:8001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+    networks:
+      - weather-alert-net
+    restart: unless-stopped
+
+  weather-fetcher:
+    build:
+      context: .
+      dockerfile: weather-fetcher/Dockerfile
+    container_name: weather-alert-weather-fetcher
+    environment:
+      PORT: 8002
+      LOG_LEVEL: info
+      REDIS_URL: redis:6379
+      NATS_URL: nats://nats:4222
+      WEATHER_API_KEY: demo  # Use real key for production
+      WEATHER_API_BASE_URL: https://api.openweathermap.org
+    ports:
+      - "8002:8002"
+    depends_on:
+      redis:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+    networks:
+      - weather-alert-net
+    restart: unless-stopped
+
+  alert-evaluator:
+    build:
+      context: .
+      dockerfile: alert-evaluator/Dockerfile
+    container_name: weather-alert-alert-evaluator
+    environment:
+      PORT: 8003
+      LOG_LEVEL: info
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: weather_app
+      DB_PASSWORD: weather_app
+      DB_NAME: weather_alert
+      REDIS_URL: redis:6379
+      NATS_URL: nats://nats:4222
+    ports:
+      - "8003:8003"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+    networks:
+      - weather-alert-net
+    restart: unless-stopped
+
+  notification-dispatcher:
+    build:
+      context: .
+      dockerfile: notification-dispatcher/Dockerfile
+    container_name: weather-alert-notification-dispatcher
+    environment:
+      PORT: 8004
+      LOG_LEVEL: info
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: weather_app
+      DB_PASSWORD: weather_app
+      DB_NAME: weather_alert
+      NATS_URL: nats://nats:4222
+      APNS_KEY_PATH: /run/secrets/apns_key
+      APNS_KEY_ID: XXXXXXXXXX
+      APNS_TEAM_ID: XXXXXXXXXX
+    ports:
+      - "8004:8004"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+    networks:
+      - weather-alert-net
+    restart: unless-stopped
+    # In production, use Docker secrets:
+    # secrets:
+    #   - apns_key
+
+volumes:
+  postgres_data:
+  redis_data:
+  nats_data:
+
+networks:
+  weather-alert-net:
+    driver: bridge
+
+# secrets:
+#   apns_key:
+#     file: ./apns-key.p8

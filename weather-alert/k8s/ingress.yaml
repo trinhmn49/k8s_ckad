@@ -1,0 +1,43 @@
+# Optional: requires `minikube addons enable ingress`
+# Add "127.0.0.1 weather-alert.local" to your hosts file, then `minikube tunnel` in a separate terminal.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: weather-alert-ingress
+  namespace: weather-alert
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: weather-alert.local
+      http:
+        paths:
+          - path: /users(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: user-service
+                port:
+                  number: 8001
+          - path: /weather(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: weather-fetcher
+                port:
+                  number: 8002
+          - path: /alerts(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: alert-evaluator
+                port:
+                  number: 8003
+          - path: /notifications(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: notification-dispatcher
+                port:
+                  number: 8004

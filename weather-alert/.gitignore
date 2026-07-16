@@ -1,0 +1,41 @@
+# Binaries
+*.exe
+*.dll
+*.so
+*.dylib
+bin/
+dist/
+
+# Build artifacts
+*.o
+*.a
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Environment
+.env
+.env.local
+*.p8
+
+# Docker
+.dockerignore
+
+# Logs
+*.log
+
+# Test coverage
+coverage.out
+*.cover
+
+# Vendor directory
+vendor/
+
+# Go mod cache
+go.sum.*
+go.mod.*
