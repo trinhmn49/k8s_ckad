@@ -10,4 +10,3 @@ data:
   DB_NAME: "weather_alert"
   REDIS_URL: "redis:6379"
   NATS_URL: "nats://nats:4222"
-  WEATHER_API_BASE_URL: "https://api.openweathermap.org"

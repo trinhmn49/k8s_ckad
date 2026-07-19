@@ -22,11 +22,6 @@ spec:
           env:
             - name: PORT
               value: "8002"
-            - name: WEATHER_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: app-secrets
-                  key: WEATHER_API_KEY
           envFrom:
             - configMapRef:
                 name: app-config
