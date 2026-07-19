@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"sync"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -47,6 +48,9 @@ func (s *NotificationService) dispatchNotification(alert *models.AlertTriggeredE
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
+	var wg sync.WaitGroup
+	defer wg.Wait()
+
 	// Get device tokens for the user
 	tokens, err := s.db.GetDeviceTokensByUser(ctx, alert.UserID)
 	if err != nil {
@@ -67,7 +71,11 @@ func (s *NotificationService) dispatchNotification(alert *models.AlertTriggeredE
 
 	// Send to all devices
 	for _, token := range tokens {
-		go s.sendAPNsNotification(ctx, alert, token)
+		wg.Add(1)
+		go func(token string) {
+			defer wg.Done()
+			s.sendAPNsNotification(ctx, alert, token)
+		}(token)
 	}
 }
 
