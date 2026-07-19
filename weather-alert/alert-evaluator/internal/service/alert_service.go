@@ -116,7 +116,12 @@ func (s *AlertEvaluatorService) checkCooldown(ctx context.Context, userID int64,
 // publishAlert publishes an alert.triggered event to NATS
 func (s *AlertEvaluatorService) publishAlert(rule *models.AlertRule, weather *models.WeatherEvent) {
 	title := fmt.Sprintf("Weather Alert: %s", rule.AlertType)
-	body := fmt.Sprintf("Alert triggered in %s (temp: %.1f°C, humidity: %d%%)", weather.Location, weather.Temperature, weather.Humidity)
+
+	aqiPart := "AQI: N/A"
+	if weather.AQI >= 0 {
+		aqiPart = fmt.Sprintf("AQI: %d", weather.AQI)
+	}
+	body := fmt.Sprintf("%s (%s, temp: %.1f°C, humidity: %d%%)", weather.Location, aqiPart, weather.Temperature, weather.Humidity)
 
 	event := models.AlertTriggeredEvent{
 		Event:     "alert.triggered",

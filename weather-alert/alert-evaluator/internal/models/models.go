@@ -5,6 +5,7 @@ import "time"
 type WeatherEvent struct {
 	Event       string    `json:"event"`
 	Location    string    `json:"location"`
+	AQI         int       `json:"aqi"`
 	Temperature float64   `json:"temperature"`
 	Humidity    int       `json:"humidity"`
 	Condition   string    `json:"condition"`

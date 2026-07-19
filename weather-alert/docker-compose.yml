@@ -90,8 +90,6 @@ services:
       LOG_LEVEL: info
       REDIS_URL: redis:6379
       NATS_URL: nats://nats:4222
-      WEATHER_API_KEY: demo  # Use real key for production
-      WEATHER_API_BASE_URL: https://api.openweathermap.org
     ports:
       - "8002:8002"
     depends_on:
@@ -148,6 +146,8 @@ services:
       APNS_KEY_PATH: /run/secrets/apns_key
       APNS_KEY_ID: XXXXXXXXXX
       APNS_TEAM_ID: XXXXXXXXXX
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
     ports:
       - "8004:8004"
     depends_on:

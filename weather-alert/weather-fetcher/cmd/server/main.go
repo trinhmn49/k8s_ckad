@@ -78,7 +78,7 @@ func main() {
 		ticker := time.NewTicker(30 * time.Minute)
 		defer ticker.Stop()
 
-		locations := []string{"London", "New York", "Tokyo", "Paris", "Sydney"}
+		locations := []string{"Hanoi", "Nam Dinh"}
 		for {
 			log.Println("Fetching weather data...")
 			for _, loc := range locations {
