@@ -1,13 +1,20 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: always-fails
+  name: db-connection-check-fail
+  namespace: weather-alert
 spec:
   backoffLimit: 2           # Only 2 retries -> fails fast for demo purposes
   template:
     spec:
       containers:
-      - name: always-fails
-        image: busybox:musl
-        command: ["/bin/sh", "-c", "echo 'about to fail'; exit 1"]
+      - name: db-connection-check-fail
+        image: postgres:15-alpine   # same real client image, pointed at a bad host on purpose
+        command:
+          - /bin/sh
+          - -c
+          - |
+            echo "Checking a deliberately wrong Postgres host..."
+            pg_isready -h postgres-wrong-host -p 5432 -U weather_app -t 2
+        # postgres-wrong-host does not exist -> pg_isready exits non-zero every time
       restartPolicy: Never

@@ -1,0 +1,103 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: notification-dispatcher-guarded
+  namespace: weather-alert
+  labels:
+    app: notification-dispatcher
+    pattern: init-sidecar
+spec:
+  volumes:
+  - name: apns-secret-vol
+    emptyDir: {}
+
+  # INIT CONTAINER: waits for the real postgres Service, then stages a credential file
+  initContainers:
+  - name: wait-for-postgres
+    image: postgres:15-alpine
+    command:
+      - /bin/sh
+      - -c
+      - |
+        until pg_isready -h postgres -p 5432 -U weather_app; do
+          echo "waiting for postgres..."
+          sleep 2
+        done
+        echo "postgres is ready"
+        echo "LAB-PLACEHOLDER-APNS-KEY-CONTENT" > /run/secrets/apns-key.p8
+        echo "staged APNs key placeholder for notification-dispatcher"
+    volumeMounts:
+    - name: apns-secret-vol
+      mountPath: /run/secrets
+    # After this completes successfully, the app container starts
+
+  # MAIN APPLICATION CONTAINER: the real notification-dispatcher binary
+  containers:
+  - name: dispatcher
+    image: weather-alert/notification-dispatcher:latest
+    imagePullPolicy: Never
+    ports:
+    - containerPort: 8004
+    envFrom:
+    - configMapRef:
+        name: app-config
+    env:
+    - name: DB_USER
+      valueFrom:
+        secretKeyRef:
+          name: app-secrets
+          key: DB_USER
+    - name: DB_PASSWORD
+      valueFrom:
+        secretKeyRef:
+          name: app-secrets
+          key: DB_PASSWORD
+    - name: APNS_KEY_ID
+      valueFrom:
+        secretKeyRef:
+          name: app-secrets
+          key: APNS_KEY_ID
+    - name: APNS_TEAM_ID
+      valueFrom:
+        secretKeyRef:
+          name: app-secrets
+          key: APNS_TEAM_ID
+    - name: APNS_KEY_PATH
+      value: /run/secrets/apns-key.p8   # points at the file the init container staged
+    volumeMounts:
+    - name: apns-secret-vol
+      mountPath: /run/secrets
+      readOnly: true
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: 250m
+        memory: 128Mi
+
+  # SIDECAR CONTAINER: polls the app's own /health endpoint and logs the result
+  - name: health-monitor
+    image: postgres:15-alpine   # already pulled for this project; ships a shell + wget
+    command:
+      - /bin/sh
+      - -c
+      - |
+        while true; do
+          if wget -qO- http://localhost:8004/health; then
+            echo "$(date): dispatcher healthy"
+          else
+            echo "$(date): dispatcher NOT reachable yet"
+          fi
+          sleep 10
+        done
+    resources:
+      requests:
+        cpu: 25m
+        memory: 32Mi
+      limits:
+        cpu: 100m
+        memory: 64Mi
+
+  restartPolicy: Always
+  dnsPolicy: ClusterFirst

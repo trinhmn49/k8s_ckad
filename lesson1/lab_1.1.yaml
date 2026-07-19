@@ -1,8 +1,27 @@
-# Lab 1.1 — The 60-Second Pod
+# Lab 1.1 — The 60-Second Pod (using the weather-alert project)
 # Duration: ~45 min | CKAD domain: Application Design and Build (20%)
 # Create a Pod imperatively with labels, environment variables, and resource requests/limits
 # Export a manifest using --dry-run=client -o yaml
 # Verify Pod state without opening an editor (exam speed path)
+# Uses the real weather-alert/user-service image - not a generic nginx/busybox placeholder
+
+# ============================================================================
+# PREREQUISITE
+# ============================================================================
+# This lab creates a standalone Pod running the ACTUAL user-service binary from
+# this repo's weather-alert/ project, alongside its already-deployed backing
+# services (Postgres/Redis/NATS) in the "weather-alert" namespace:
+#   kubectl apply -f ../weather-alert/k8s/namespace.yaml
+#   kubectl apply -f ../weather-alert/k8s/configmaps/
+#   kubectl apply -f ../weather-alert/k8s/secrets/
+#   kubectl apply -f ../weather-alert/k8s/backing-services/
+# The image must be built into minikube's own Docker daemon first (from WSL):
+#   eval $(minikube docker-env)
+#   docker build -t weather-alert/user-service:latest -f user-service/Dockerfile .
+# (run from the weather-alert/ directory)
+# Verify prerequisites:
+#   kubectl -n weather-alert get pods
+# postgres/redis/nats should be Running before starting this lab.
 
 # ============================================================================
 # SOLUTION
@@ -10,27 +29,29 @@
 
 # STEP 1: Create Pod imperatively with all required specifications
 # Command to run:
-kubectl run web-server \
-  --image=nginx:alpine \
-  --labels="app=web,tier=frontend" \
-  --env="APP_ENV=production,LOG_LEVEL=info" \
-  --requests="cpu=100m,memory=128Mi" \
-  --limits="cpu=500m,memory=256Mi" \
-  --port=80 \
-  -n default
+kubectl run user-service-standalone \
+  --image=weather-alert/user-service:latest \
+  --image-pull-policy=Never \
+  --labels="app=user-service,tier=api" \
+  --env="PORT=8001,LOG_LEVEL=info,DB_HOST=postgres,DB_PORT=5432,DB_USER=weather_app,DB_PASSWORD=weather_app,DB_NAME=weather_alert,NATS_URL=nats://nats:4222" \
+  --requests="cpu=50m,memory=64Mi" \
+  --limits="cpu=250m,memory=128Mi" \
+  --port=8001 \
+  -n weather-alert
 
 # ============================================================================
 # STEP 2: Export the Pod manifest (dry-run for reference)
 # This shows what was created:
-kubectl run web-server \
-  --image=nginx:alpine \
-  --labels="app=web,tier=frontend" \
-  --env="APP_ENV=production,LOG_LEVEL=info" \
-  --requests="cpu=100m,memory=128Mi" \
-  --limits="cpu=500m,memory=256Mi" \
-  --port=80 \
-  --dry-run=client \
-  -o yaml
+kubectl run user-service-standalone \
+  --image=weather-alert/user-service:latest \
+  --image-pull-policy=Never \
+  --labels="app=user-service,tier=api" \
+  --env="PORT=8001,LOG_LEVEL=info,DB_HOST=postgres,DB_PORT=5432,DB_USER=weather_app,DB_PASSWORD=weather_app,DB_NAME=weather_alert,NATS_URL=nats://nats:4222" \
+  --requests="cpu=50m,memory=64Mi" \
+  --limits="cpu=250m,memory=128Mi" \
+  --port=8001 \
+  -n weather-alert \
+  --dry-run=client -o yaml
 
 # ============================================================================
 # STEP 3: Exported YAML Manifest (for reference)
@@ -40,30 +61,42 @@ kind: Pod
 metadata:
   creationTimestamp: null
   labels:
-    app: web
-    tier: frontend
-  name: web-server
-  namespace: default
+    app: user-service
+    tier: api
+  name: user-service-standalone
+  namespace: weather-alert
 spec:
   containers:
   - env:
-    - name: APP_ENV
-      value: production
+    - name: PORT
+      value: "8001"
     - name: LOG_LEVEL
       value: info
-    image: nginx:alpine
-    imagePullPolicy: IfNotPresent
-    name: web-server
+    - name: DB_HOST
+      value: postgres
+    - name: DB_PORT
+      value: "5432"
+    - name: DB_USER
+      value: weather_app
+    - name: DB_PASSWORD
+      value: weather_app
+    - name: DB_NAME
+      value: weather_alert
+    - name: NATS_URL
+      value: nats://nats:4222
+    image: weather-alert/user-service:latest
+    imagePullPolicy: Never
+    name: user-service-standalone
     ports:
-    - containerPort: 80
+    - containerPort: 8001
       protocol: TCP
     resources:
       limits:
-        cpu: 500m
-        memory: 256Mi
-      requests:
-        cpu: 100m
+        cpu: 250m
         memory: 128Mi
+      requests:
+        cpu: 50m
+        memory: 64Mi
   dnsPolicy: ClusterFirst
   restartPolicy: Always
 status: {}
@@ -72,22 +105,33 @@ status: {}
 # STEP 4: Verification commands (no editor needed)
 
 # Get Pod details:
-kubectl get pod web-server -o wide
+kubectl -n weather-alert get pod user-service-standalone -o wide
 
 # Check Pod status and events:
-kubectl describe pod web-server
+kubectl -n weather-alert describe pod user-service-standalone
 
 # Verify labels:
-kubectl get pod web-server -o jsonpath='{.metadata.labels}'
+kubectl -n weather-alert get pod user-service-standalone -o jsonpath='{.metadata.labels}'
 
 # Verify environment variables:
-kubectl exec web-server -- printenv | grep -E "APP_ENV|LOG_LEVEL"
+kubectl -n weather-alert exec user-service-standalone -- printenv | grep -E "PORT|DB_HOST|NATS_URL"
 
 # Verify resource requests/limits:
-kubectl get pod web-server -o jsonpath='{.spec.containers[0].resources}'
+kubectl -n weather-alert get pod user-service-standalone -o jsonpath='{.spec.containers[0].resources}'
 
 # Check if Pod is running:
-kubectl get pod web-server -o jsonpath='{.status.phase}'
+kubectl -n weather-alert get pod user-service-standalone -o jsonpath='{.status.phase}'
+
+# Prove this is the REAL app, not a placeholder - hit its actual /health endpoint
+# from inside the Pod's own network namespace (alpine's busybox provides wget):
+kubectl -n weather-alert exec user-service-standalone -- wget -qO- http://localhost:8001/health
+
+# ============================================================================
+# CLEANUP
+# ============================================================================
+# This standalone Pod is separate from the real user-service Deployment -
+# safe to delete without touching the actual running project:
+kubectl -n weather-alert delete pod user-service-standalone --ignore-not-found
 
 # ============================================================================
 # EXAM TIPS:
@@ -95,3 +139,5 @@ kubectl get pod web-server -o jsonpath='{.status.phase}'
 # - Combine all flags in one command for speed
 # - Use -o jsonpath for quick verification without opening editor
 # - Labels are crucial for workload selection in CKAD
+# - --image-pull-policy=Never is required for locally-built images on minikube -
+#   without it the kubelet tries (and fails) to pull from a registry

@@ -1,21 +1,25 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: data-processor
+  name: db-migrate
+  namespace: weather-alert
 spec:
   backoffLimit: 3          # Retry up to 3 times on failure before giving up
   template:
     spec:
       containers:
-      - name: data-processor
-        image: busybox:musl
+      - name: db-migrate
+        image: postgres:15-alpine   # the project's own Postgres client, not busybox
         command:
         - /bin/sh
         - -c
         - |
-          echo "Processing data..."
-          sleep 5
-          echo "Done"
+          echo "Applying schema (idempotent - CREATE TABLE IF NOT EXISTS)..."
+          psql "postgresql://weather_app:weather_app@postgres:5432/weather_alert" -f /migrations/schema.sql
+          echo "Schema apply complete"
+        volumeMounts:
+        - name: schema-vol
+          mountPath: /migrations
         resources:
           requests:
             cpu: 50m
@@ -23,4 +27,8 @@ spec:
           limits:
             cpu: 200m
             memory: 128Mi
+      volumes:
+      - name: schema-vol
+        configMap:
+          name: postgres-init-schema   # same ConfigMap already used to bootstrap postgres
       restartPolicy: Never   # Never or OnFailure required for Jobs

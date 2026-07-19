@@ -13,10 +13,38 @@ spec:
       labels:
         app: alert-evaluator
     spec:
+      volumes:
+        - name: log-vol
+          emptyDir: {}
+
+      # INIT CONTAINER: block until the real postgres Service is reachable.
+      # alert-evaluator's main.go calls dbPool.Ping() once at startup and
+      # log.Fatalf()s if Postgres isn't up yet - Deployments have no
+      # guaranteed startup ordering, so this is the real production fix
+      # (same pattern as lesson1/lab_1.2.yaml's wait-for-postgres).
+      initContainers:
+        - name: wait-for-postgres
+          image: postgres:15-alpine
+          command:
+            - /bin/sh
+            - -c
+            - |
+              until pg_isready -h postgres -p 5432 -U weather_app; do
+                echo "waiting for postgres..."
+                sleep 2
+              done
+              echo "postgres is ready"
+
       containers:
         - name: alert-evaluator
           image: weather-alert/alert-evaluator:latest
           imagePullPolicy: Never
+          # Tee stdout to a shared file so the log-shipper sidecar can tail it.
+          # The app's own behavior is unchanged - this only duplicates its output.
+          command:
+            - /bin/sh
+            - -c
+            - "./app 2>&1 | tee -a /var/log/app/alert-evaluator.log"
           ports:
             - containerPort: 8003
           env:
@@ -35,6 +63,9 @@ spec:
           envFrom:
             - configMapRef:
                 name: app-config
+          volumeMounts:
+            - name: log-vol
+              mountPath: /var/log/app
           readinessProbe:
             httpGet:
               path: /health
@@ -54,6 +85,27 @@ spec:
             limits:
               cpu: 250m
               memory: 128Mi
+
+        # SIDECAR: log-shipper. Shares the log-vol emptyDir with the app
+        # container and tails it - the same visibility a real log-forwarder
+        # (Fluent Bit, Vector, etc.) would have, without needing hostPath
+        # access to the node's container log directory.
+        - name: log-shipper
+          image: postgres:15-alpine   # already pulled for this project; ships a shell + tail
+          command:
+            - /bin/sh
+            - -c
+            - "touch /var/log/app/alert-evaluator.log && tail -F /var/log/app/alert-evaluator.log"
+          volumeMounts:
+            - name: log-vol
+              mountPath: /var/log/app
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
 ---
 apiVersion: v1
 kind: Service

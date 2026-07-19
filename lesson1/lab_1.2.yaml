@@ -1,41 +1,55 @@
-Lab 1.2 — Init + Sidecar Pattern
-Duration: ~60 min | CKAD domain: Application Design and Build (20%)
-Build a multi-container Pod with init container, app container, and sidecar
-Share data via emptyDir volume
-Tail application logs from sidecar using kubectl logs -c
+# Lab 1.2 — Init + Sidecar Pattern (using the weather-alert project)
+# Duration: ~60 min | CKAD domain: Application Design and Build (20%)
+# Build a multi-container Pod with init container, app container, and sidecar
+# Share data via emptyDir volume
+# Tail application logs from sidecar using kubectl logs -c
+# Uses the real weather-alert/notification-dispatcher image and postgres:15-alpine
+# (the project's own backing-service image) - not generic nginx/busybox placeholders
+
+# ============================================================================
+# PREREQUISITE
+# ============================================================================
+# Requires the weather-alert namespace + backing services already deployed
+# (postgres, redis, nats) and the notification-dispatcher image built into
+# minikube's Docker daemon:
+#   eval $(minikube docker-env)
+#   docker build -t weather-alert/notification-dispatcher:latest \
+#     -f notification-dispatcher/Dockerfile .
+# (run from the weather-alert/ directory)
+# Verify: kubectl -n weather-alert get pods   (postgres should be Running)
 
 # ============================================================================
 # DETAILED EXPLANATION
 # ============================================================================
-# 
-# THE PATTERN HAS 3 CONTAINER ROLES:
+#
+# THIS LAB'S PATTERN MAPS TO A REAL PROBLEM IN THE WEATHER-ALERT PROJECT:
+# notification-dispatcher's main.go calls dbPool.Ping() once at startup and
+# log.Fatalf()s if Postgres isn't reachable yet - Kubernetes gives Deployments
+# no guaranteed startup ordering, so a real init container that WAITS for the
+# dependency is the correct production fix (not just a teaching toy).
 #
 # 1. INIT CONTAINER (runs-to-completion BEFORE app starts)
-#    - Prepares the shared volume with initial data
-#    - Sets up configuration files or scripts
+#    - Uses postgres:15-alpine's own `pg_isready` client to block until the
+#      real "postgres" Service actually has a Ready backend
+#    - Also writes a placeholder credential file to the shared volume,
+#      simulating fetching the real APNs cert from a vault/secret store
+#      before notification-dispatcher needs APNS_KEY_PATH
 #    - Runs once at Pod startup, then terminates successfully
-#    - Pod waits for init container to complete before starting app containers
-#    - Use case: Download configs, validate prerequisites, prepare shared storage
 #
-# 2. APP CONTAINER (main application)
-#    - The primary application serving requests
-#    - Reads/writes to the shared emptyDir volume
-#    - Runs continuously unless explicitly stopped
-#    - Logs its operations to the shared volume
-#    - Use case: Web server, API, main business logic
+# 2. APP CONTAINER (the real notification-dispatcher binary)
+#    - Reads APNS_KEY_PATH from the shared volume the init container prepared
+#    - Serves /health on 8004 once Postgres/NATS are reachable
 #
-# 3. SIDECAR CONTAINER (runs alongside app)
-#    - Monitoring or auxiliary service running in parallel with app
-#    - Tails logs from the shared volume and processes them
-#    - Can monitor, transform, forward, or aggregate data
-#    - Shares the same lifecycle as the app container
-#    - Use case: Log shipper, monitoring agent, data transformer
+# 3. SIDECAR CONTAINER (health-monitor, reusing postgres:15-alpine's shell+wget)
+#    - Shares the Pod's network namespace, so `localhost:8004` reaches the app
+#    - Polls /health every 10s and logs the result - the same visibility
+#      pattern a real log-shipper or monitoring sidecar would use
 #
 # SHARED VOLUME (emptyDir):
 #    - Created when Pod starts, destroyed when Pod terminates
-#    - Mounted in all containers at the same path
-#    - Allows inter-container communication via files
-#    - Data persists for the Pod's lifetime but not beyond
+#    - Mounted in both the init container and the app container at the same path
+#    - This is exactly how you'd hand off a fetched cert/token from an init
+#      container to the main app container in a real cluster
 #
 # ============================================================================
 
@@ -43,83 +57,103 @@ Tail application logs from sidecar using kubectl logs -c
 apiVersion: v1
 kind: Pod
 metadata:
-  name: multi-container-app
+  name: notification-dispatcher-guarded
+  namespace: weather-alert
   labels:
-    app: demo
+    app: notification-dispatcher
     pattern: init-sidecar
 spec:
-  # Volume shared by all containers
   volumes:
-  - name: shared-data
-    emptyDir: {}  # Created/destroyed with Pod lifecycle
+  - name: apns-secret-vol
+    emptyDir: {}
 
-  # INIT CONTAINER: Runs first, prepares shared volume
+  # INIT CONTAINER: waits for the real postgres Service, then stages a credential file
   initContainers:
-  - name: init-setup
-    image: busybox:latest
-    command: 
-      - /bin/sh
-      - -c
-      - |
-        echo "=== INIT CONTAINER RUNNING ===" > /shared/app.log
-        echo "Initializing shared volume..." >> /shared/app.log
-        echo "Timestamp: $(date)" >> /shared/app.log
-        echo "Init container completed successfully" >> /shared/app.log
-        sleep 2
-    volumeMounts:
-    - name: shared-data
-      mountPath: /shared
-    # After init completes successfully, app containers start
-
-  # MAIN APPLICATION CONTAINER
-  containers:
-  - name: app
-    image: nginx:alpine
-    ports:
-    - containerPort: 8080
-    volumeMounts:
-    - name: shared-data
-      mountPath: /shared
-    # App writes logs to shared volume
-    lifecycle:
-      postStart:
-        exec:
-          command: 
-            - /bin/sh
-            - -c
-            - |
-              echo "" >> /shared/app.log
-              echo "=== APP CONTAINER STARTED ===" >> /shared/app.log
-              echo "App serving on port 8080" >> /shared/app.log
-              echo "Timestamp: $(date)" >> /shared/app.log
-    resources:
-      requests:
-        cpu: 100m
-        memory: 128Mi
-      limits:
-        cpu: 500m
-        memory: 256Mi
-
-  # SIDECAR CONTAINER: Tails and processes logs
-  - name: log-sidecar
-    image: busybox:latest
+  - name: wait-for-postgres
+    image: postgres:15-alpine
     command:
       - /bin/sh
       - -c
       - |
-        # Tail the app.log file continuously
-        tail -f /shared/app.log
+        until pg_isready -h postgres -p 5432 -U weather_app; do
+          echo "waiting for postgres..."
+          sleep 2
+        done
+        echo "postgres is ready"
+        echo "LAB-PLACEHOLDER-APNS-KEY-CONTENT" > /run/secrets/apns-key.p8
+        echo "staged APNs key placeholder for notification-dispatcher"
     volumeMounts:
-    - name: shared-data
-      mountPath: /shared
-    # No resource limits for tail (monitoring process)
+    - name: apns-secret-vol
+      mountPath: /run/secrets
+    # After this completes successfully, the app container starts
+
+  # MAIN APPLICATION CONTAINER: the real notification-dispatcher binary
+  containers:
+  - name: dispatcher
+    image: weather-alert/notification-dispatcher:latest
+    imagePullPolicy: Never
+    ports:
+    - containerPort: 8004
+    envFrom:
+    - configMapRef:
+        name: app-config
+    env:
+    - name: DB_USER
+      valueFrom:
+        secretKeyRef:
+          name: app-secrets
+          key: DB_USER
+    - name: DB_PASSWORD
+      valueFrom:
+        secretKeyRef:
+          name: app-secrets
+          key: DB_PASSWORD
+    - name: APNS_KEY_ID
+      valueFrom:
+        secretKeyRef:
+          name: app-secrets
+          key: APNS_KEY_ID
+    - name: APNS_TEAM_ID
+      valueFrom:
+        secretKeyRef:
+          name: app-secrets
+          key: APNS_TEAM_ID
+    - name: APNS_KEY_PATH
+      value: /run/secrets/apns-key.p8   # points at the file the init container staged
+    volumeMounts:
+    - name: apns-secret-vol
+      mountPath: /run/secrets
+      readOnly: true
     resources:
       requests:
         cpu: 50m
         memory: 64Mi
       limits:
-        cpu: 200m
+        cpu: 250m
         memory: 128Mi
+
+  # SIDECAR CONTAINER: polls the app's own /health endpoint and logs the result
+  - name: health-monitor
+    image: postgres:15-alpine   # already pulled for this project; ships a shell + wget
+    command:
+      - /bin/sh
+      - -c
+      - |
+        while true; do
+          if wget -qO- http://localhost:8004/health; then
+            echo "$(date): dispatcher healthy"
+          else
+            echo "$(date): dispatcher NOT reachable yet"
+          fi
+          sleep 10
+        done
+    resources:
+      requests:
+        cpu: 25m
+        memory: 32Mi
+      limits:
+        cpu: 100m
+        memory: 64Mi
 
   restartPolicy: Always
   dnsPolicy: ClusterFirst
@@ -132,64 +166,60 @@ spec:
 kubectl apply -f lab_1.2.yaml
 
 # Check Pod creation:
-kubectl get pod multi-container-app
+kubectl -n weather-alert get pod notification-dispatcher-guarded
 
 # Watch the init container run:
-kubectl get pod multi-container-app -w
+kubectl -n weather-alert get pod notification-dispatcher-guarded -w
 
 # ============================================================================
 # STEP 2: VERIFY INIT CONTAINER COMPLETED
 # ============================================================================
 
 # Check Pod events (shows init container execution):
-kubectl describe pod multi-container-app
+kubectl -n weather-alert describe pod notification-dispatcher-guarded
 
 # Expected output shows:
-#   - Init container completed
-#   - All app containers started
+#   - wait-for-postgres completed (postgres was already Running)
+#   - Both regular containers started
 #   - No restart loops
 
 # ============================================================================
 # STEP 3: VIEW LOGS FROM EACH CONTAINER
 # ============================================================================
 
-# View logs from init container (one-time execution):
-kubectl logs multi-container-app -c init-setup
-# Output: Shows initialization messages
+# View logs from the init container (one-time execution):
+kubectl -n weather-alert logs notification-dispatcher-guarded -c wait-for-postgres
+# Output: "postgres is ready" + confirmation the key file was staged
 
-# View logs from app container:
-kubectl logs multi-container-app -c app
-# Output: App startup messages (sparse, nginx mostly silent)
+# View logs from the real app container:
+kubectl -n weather-alert logs notification-dispatcher-guarded -c dispatcher
+# Output: "Starting notification-dispatcher...", "Database connected", "NATS connection initialized"
 
-# View logs from sidecar container (tailing app.log):
-kubectl logs multi-container-app -c log-sidecar
-# Output: All messages from shared/app.log in real-time
+# View logs from the sidecar (tailing /health every 10s):
+kubectl -n weather-alert logs notification-dispatcher-guarded -c health-monitor
+# Output: periodic "dispatcher healthy" lines with the actual JSON health response
 
 # ============================================================================
 # STEP 4: EXAMINE SHARED VOLUME CONTENTS
 # ============================================================================
 
-# Shell into app container:
-kubectl exec -it multi-container-app -c app -- /bin/sh
+# Shell into the app container:
+kubectl -n weather-alert exec -it notification-dispatcher-guarded -c dispatcher -- /bin/sh
 
-# Inside the container, check shared volume:
-cat /shared/app.log
-# Shows all messages written by init and app
+# Inside the container, check the file the init container staged:
+cat /run/secrets/apns-key.p8
+# Shows: LAB-PLACEHOLDER-APNS-KEY-CONTENT
 
 # Exit the shell:
 exit
 
 # ============================================================================
-# STEP 5: VERIFY DATA SHARING BETWEEN CONTAINERS
+# STEP 5: VERIFY THE SIDECAR CAN REACH THE APP OVER LOCALHOST
 # ============================================================================
 
-# Execute command to append to log from app container:
-kubectl exec multi-container-app -c app -- \
-  sh -c "echo 'Message from app container' >> /shared/app.log"
-
-# View updated logs from sidecar:
-kubectl logs multi-container-app -c log-sidecar --tail=5
-# Shows the newly appended message
+# All containers in a Pod share one network namespace - prove it directly:
+kubectl -n weather-alert exec notification-dispatcher-guarded -c health-monitor -- \
+  wget -qO- http://localhost:8004/health
 
 # ============================================================================
 # KEY CONCEPTS FOR CKAD EXAM
@@ -198,38 +228,46 @@ kubectl logs multi-container-app -c log-sidecar --tail=5
 # 1. INIT CONTAINER:
 #    - Defined under spec.initContainers (plural!)
 #    - Runs sequentially before regular containers
-#    - If init fails, Pod enters CrashLoopBackOff
-#    - Use for: setup, validation, preparation
+#    - If init fails (or never satisfies its wait loop), Pod stays Init:0/1 forever
+#    - Real use case demonstrated here: block until a dependency (Postgres) is reachable
 
 # 2. EMPTYDIR VOLUME:
 #    - Storage tied to Pod lifecycle
-#    - Mounts to same path in all containers
-#    - Perfect for inter-container communication
-#    - Lost when Pod is deleted
+#    - Mounts to same path in both the init container and the app container
+#    - Real use case demonstrated here: hand off a staged credential file
 
 # 3. SIDECAR PATTERN:
-#    - Secondary container running alongside primary
-#    - Shares Pod's network namespace (can reach localhost)
-#    - Common uses: logging, monitoring, proxying
+#    - Secondary container running alongside the primary app
+#    - Shares the Pod's network namespace (reaches the app via localhost)
+#    - Real use case demonstrated here: an out-of-process health monitor
 
 # 4. LOGGING STRATEGY:
-#    - Use kubectl logs -c <container> to view specific container
-#    - Use kubectl logs <pod> to view primary container
-#    - Sidecars often handle log aggregation
+#    - Use kubectl logs -c <container> to view a specific container
+#    - Use kubectl logs <pod> to view the default (first) container
+#    - Sidecars often handle monitoring/log aggregation exactly like this one
 
 # ============================================================================
 # TROUBLESHOOTING
 # ============================================================================
 
-# If Pod stuck in Init:0/1 or Init:1/3:
-# - Check init container logs: kubectl logs <pod> -c <init-container>
-# - Describe pod for error messages: kubectl describe pod <pod>
+# If Pod stuck in Init:0/1:
+# - wait-for-postgres is still polling - check if postgres is actually Running:
+#   kubectl -n weather-alert get pods -l app=postgres
+# - kubectl -n weather-alert logs notification-dispatcher-guarded -c wait-for-postgres
 
-# If containers can't see shared volume:
-# - Verify volume mounts exist: kubectl get pod <pod> -o yaml | grep -A5 volumeMounts
-# - Check volume definition: kubectl get pod <pod> -o yaml | grep -A5 volumes
+# If the dispatcher container crash-loops instead of waiting:
+# - Confirm the init container actually completed first (Pod shouldn't start the
+#   app container at all until it does) - this is the whole point of the pattern
 
-# If sidecar not getting logs:
-# - Verify file permissions in shared volume
-# - Check if app is actually writing to the file
-# - Use kubectl exec to check contents directly
+# If health-monitor logs show "NOT reachable":
+# - Confirm the dispatcher container itself is Ready: kubectl describe pod ...
+# - Container startup order within "containers:" is NOT guaranteed - the sidecar
+#   may poll a few times before the app is actually listening, which is expected
+
+# ============================================================================
+# EXAM TIPS:
+# - "Wait for a dependency" is one of the most common REAL init-container use
+#   cases - much more common on the exam/production than writing log files
+# - Sidecars reach the app via localhost:<port>, never via the Pod's DNS name
+# - kubectl logs -c is required the moment a Pod has more than one container -
+#   forgetting -c and getting an ambiguous-container error is a common exam slip

@@ -62,3 +62,60 @@ spec:
     - port: 8002
       targetPort: 8002
   type: ClusterIP
+---
+# weather-fetcher's own internal ticker (cmd/server/main.go) only auto-fetches
+# a hardcoded list of 5 cities every 30 min. This one-off Job calls the same
+# public API to fetch NEW data for cities outside that list, on demand -
+# no app code change or redeploy needed.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: weather-fetch-extra-cities
+  namespace: weather-alert
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      containers:
+        - name: weather-fetch-extra-cities
+          image: postgres:15-alpine   # already pulled for this project; ships a shell + wget
+          command:
+            - /bin/sh
+            - -c
+            - |
+              for city in Berlin Singapore; do
+                echo "Fetching weather for $city..."
+                wget -qO- "http://weather-fetcher:8002/api/v1/weather/$city"
+                echo
+              done
+      restartPolicy: Never
+---
+# CronJob version of the same task - keeps the extra (non-default) cities'
+# Redis cache warm on its own schedule, independent of the app's built-in loop.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: weather-fetch-refresh
+  namespace: weather-alert
+spec:
+  schedule: "*/5 * * * *"       # every 5 min for demo speed (real: match/complement the 30-min internal loop)
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        spec:
+          containers:
+            - name: weather-fetch-refresh
+              image: postgres:15-alpine
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  for city in Berlin Singapore; do
+                    wget -qO- "http://weather-fetcher:8002/api/v1/weather/$city"
+                    echo
+                  done
+          restartPolicy: OnFailure

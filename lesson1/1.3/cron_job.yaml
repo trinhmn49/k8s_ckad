@@ -1,9 +1,10 @@
 apiVersion: batch/v1
 kind: CronJob
 metadata:
-  name: report-generator
+  name: notification-log-cleanup
+  namespace: weather-alert
 spec:
-  schedule: "*/1 * * * *"       # Every minute (min hour dom month dow)
+  schedule: "*/1 * * * *"       # Every minute for demo speed (real deployments: daily, e.g. "0 3 * * *")
   concurrencyPolicy: Forbid     # Skip new run if previous still active
   successfulJobsHistoryLimit: 3 # Keep last 3 successful Jobs
   failedJobsHistoryLimit: 1     # Keep last 1 failed Job
@@ -13,12 +14,14 @@ spec:
       template:
         spec:
           containers:
-          - name: report-generator
-            image: busybox:musl
+          - name: notification-log-cleanup
+            image: postgres:15-alpine   # real client against the real notification_log table
             command:
             - /bin/sh
             - -c
             - |
-              date
-              echo "Generating report..."
+              echo "Cleaning up notification_log entries older than 30 days..."
+              psql "postgresql://weather_app:weather_app@postgres:5432/weather_alert" \
+                -c "DELETE FROM notification_log WHERE created_at < NOW() - INTERVAL '30 days';"
+              echo "Cleanup complete"
           restartPolicy: OnFailure

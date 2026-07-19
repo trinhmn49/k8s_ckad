@@ -1,0 +1,240 @@
+# Lab 2.1 — Deployments: Scaling, Rolling Updates & Rollbacks
+# Duration: ~60 min | CKAD domain: Application Deployment (20%)
+# Scale a real Deployment and observe ReplicaSet behavior
+# Trigger a rolling update and watch readiness probes gate traffic
+# Inspect rollout history and roll back a bad release
+# Understand maxSurge / maxUnavailable
+
+# ============================================================================
+# PREREQUISITE
+# ============================================================================
+# This lab runs against the weather-alert project's user-service Deployment,
+# already deployed to minikube under the "weather-alert" namespace:
+#   kubectl apply -f ../../weather-alert/k8s/namespace.yaml
+#   kubectl apply -f ../../weather-alert/k8s/configmaps/
+#   kubectl apply -f ../../weather-alert/k8s/secrets/
+#   kubectl apply -f ../../weather-alert/k8s/backing-services/
+#   kubectl apply -f ../../weather-alert/k8s/deployments/
+# Verify first:
+#   kubectl -n weather-alert get deployment user-service
+# Should show 2/2 READY.
+
+# ============================================================================
+# DETAILED EXPLANATION
+# ============================================================================
+#
+# DEPLOYMENT -> REPLICASET -> POD OWNERSHIP CHAIN
+#
+#    Deployment (you edit this)
+#         |
+#         v  creates/manages
+#    ReplicaSet (one per revision - old ones kept for rollback, scaled to 0)
+#         |
+#         v  creates/manages
+#    Pod (actual running containers)
+#
+#    - You almost never touch ReplicaSets directly; the Deployment controller does
+#    - Every change to .spec.template (image, env, etc.) creates a NEW ReplicaSet
+#    - Every change to ONLY .spec.replicas scales the EXISTING ReplicaSet (no new revision)
+#
+# ROLLING UPDATE MECHANICS
+#    - Default strategy: RollingUpdate (vs Recreate, which kills all Pods first)
+#    - maxUnavailable: how many Pods can be down during the rollout (default 25%)
+#    - maxSurge: how many EXTRA Pods can be created above desired count (default 25%)
+#    - A new Pod only receives traffic once its readinessProbe passes -
+#      this is why user-service's /health readiness probe matters for zero-downtime rollouts
+#    - Old Pods are only terminated after enough new Pods are Ready
+#
+# ROLLBACK MECHANICS
+#    - Every revision is tracked (up to .spec.revisionHistoryLimit, default 10)
+#    - `kubectl rollout undo` re-applies a previous ReplicaSet's Pod template
+#    - This creates a NEW revision (it doesn't "go back in time" - rollback is itself a rollout)
+#
+# ============================================================================
+
+# ============================================================================
+# STEP 1: Baseline - inspect the Deployment/ReplicaSet/Pod chain
+# ============================================================================
+
+kubectl -n weather-alert get deployment user-service
+kubectl -n weather-alert get replicaset -l app=user-service
+kubectl -n weather-alert get pods -l app=user-service -o wide
+
+# See which ReplicaSet owns which Pod:
+kubectl -n weather-alert get pods -l app=user-service \
+  -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.metadata.ownerReferences[0].name}{"\n"}{end}'
+
+# ============================================================================
+# STEP 2: Scale (replicas-only change -> NO new ReplicaSet)
+# ============================================================================
+
+kubectl -n weather-alert scale deployment user-service --replicas=4
+
+# Watch new Pods come up:
+kubectl -n weather-alert get pods -l app=user-service -w
+# (Ctrl+C once all 4 are Running/Ready)
+
+# Confirm still only ONE ReplicaSet (scaling ≠ new revision):
+kubectl -n weather-alert get replicaset -l app=user-service
+
+# Confirm the Service already load-balances across all 4 (label selector, no edit needed):
+kubectl -n weather-alert get endpoints user-service
+
+# ============================================================================
+# STEP 3: Trigger a rolling update (image change -> NEW ReplicaSet)
+# ============================================================================
+
+# Build a "v2" image locally (a trivial change is enough to prove the rollout works;
+# e.g. edit a log line in user-service/cmd/server/main.go first). From WSL, with
+# `eval $(minikube docker-env)` active:
+#   docker build -t weather-alert/user-service:v2 -f user-service/Dockerfile .
+
+# Update the Deployment to the new tag (imperative - exam speed path):
+kubectl -n weather-alert set image deployment/user-service user-service=weather-alert/user-service:v2
+
+# Watch the rollout - old and new Pods coexist briefly, gated by readiness:
+kubectl -n weather-alert rollout status deployment/user-service
+
+# In a second terminal while the above is running, watch Pods transition:
+kubectl -n weather-alert get pods -l app=user-service -w
+
+# Confirm a NEW ReplicaSet now exists (old one scaled to 0, kept for rollback):
+kubectl -n weather-alert get replicaset -l app=user-service
+
+# ============================================================================
+# STEP 4: Inspect rollout history
+# ============================================================================
+
+kubectl -n weather-alert rollout history deployment/user-service
+
+# See details of a specific revision:
+kubectl -n weather-alert rollout history deployment/user-service --revision=1
+kubectl -n weather-alert rollout history deployment/user-service --revision=2
+
+# ============================================================================
+# STEP 5: Roll back a "bad" release
+# ============================================================================
+
+# Roll back to the immediately previous revision:
+kubectl -n weather-alert rollout undo deployment/user-service
+
+kubectl -n weather-alert rollout status deployment/user-service
+
+# Confirm the image is back to the previous tag:
+kubectl -n weather-alert get deployment user-service \
+  -o jsonpath='{.spec.template.spec.containers[0].image}'
+
+# Roll back to a SPECIFIC revision (useful when undo isn't enough):
+kubectl -n weather-alert rollout undo deployment/user-service --to-revision=1
+
+# Note: rollback creates a NEW revision - it does not delete history:
+kubectl -n weather-alert rollout history deployment/user-service
+
+# ============================================================================
+# STEP 6: Reference manifest - tuning rollout behavior
+# ============================================================================
+# Add this strategy block to a Deployment spec to control rollout speed/safety:
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: user-service
+  namespace: weather-alert
+spec:
+  replicas: 4
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1   # at most 1 Pod down at a time during rollout
+      maxSurge: 1         # at most 1 extra Pod above desired count
+  revisionHistoryLimit: 5 # keep only the last 5 old ReplicaSets
+  selector:
+    matchLabels:
+      app: user-service
+  template:
+    metadata:
+      labels:
+        app: user-service
+    spec:
+      containers:
+      - name: user-service
+        image: weather-alert/user-service:latest
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8001
+          initialDelaySeconds: 5
+          periodSeconds: 10
+
+# ============================================================================
+# STEP 7: Verification commands
+# ============================================================================
+
+# Confirm final replica count and image:
+kubectl -n weather-alert get deployment user-service -o wide
+
+# Confirm no Pods stuck in a bad state:
+kubectl -n weather-alert get pods -l app=user-service
+
+# Confirm the app actually works after all this churn:
+kubectl -n weather-alert port-forward svc/user-service 8001:8001 &
+curl http://localhost:8001/health
+
+# ============================================================================
+# CLEANUP
+# ============================================================================
+# Scale back to the original replica count so the rest of the project matches
+# what's checked into weather-alert/k8s/deployments/user-service.yaml:
+kubectl -n weather-alert scale deployment user-service --replicas=2
+kubectl -n weather-alert set image deployment/user-service user-service=weather-alert/user-service:latest
+kubectl -n weather-alert rollout status deployment/user-service
+
+# ============================================================================
+# KEY CONCEPTS FOR CKAD EXAM
+# ============================================================================
+#
+# 1. WHAT CREATES A NEW REVISION:
+#    - Changing .spec.template (image, env, command, labels in the template) -> NEW ReplicaSet
+#    - Changing ONLY .spec.replicas -> same ReplicaSet, just scaled
+#
+# 2. ROLLOUT COMMANDS:
+#    - kubectl rollout status deployment/<name>        -> watch current rollout
+#    - kubectl rollout history deployment/<name>        -> list revisions
+#    - kubectl rollout undo deployment/<name>            -> back to previous revision
+#    - kubectl rollout undo deployment/<name> --to-revision=N -> back to specific revision
+#    - kubectl rollout restart deployment/<name>         -> force new Pods without changing spec
+#    - kubectl rollout pause / resume deployment/<name>  -> stop mid-rollout, then continue
+#
+# 3. STRATEGY FIELDS:
+#    - maxUnavailable -> tolerance for Pods being down during rollout
+#    - maxSurge       -> tolerance for extra Pods above replica count during rollout
+#    - Recreate strategy kills ALL old Pods before creating new ones (downtime, but simple)
+#
+# 4. READINESS PROBES GATE ROLLOUTS:
+#    - A new Pod isn't added to the Service's Endpoints until readinessProbe passes
+#    - Without a readinessProbe, Kubernetes assumes Ready as soon as the container starts,
+#      which can send traffic to a Pod that isn't actually ready to serve requests
+#
+# ============================================================================
+# TROUBLESHOOTING
+# ============================================================================
+#
+# If rollout hangs at "x out of y new replicas updated":
+# - New Pods are probably failing readinessProbe - check:
+#   kubectl -n weather-alert describe pod <new-pod-name>
+#   kubectl -n weather-alert logs <new-pod-name>
+#
+# If `rollout undo` doesn't seem to change anything:
+# - Confirm there IS a previous revision: kubectl rollout history deployment/<name>
+# - If revisionHistoryLimit was too low, the old ReplicaSet may already be garbage collected
+#
+# If scaling doesn't create/remove Pods:
+# - Check for a HorizontalPodAutoscaler overriding your manual replica count:
+#   kubectl -n weather-alert get hpa
+#
+# ============================================================================
+# EXAM TIPS:
+# - `kubectl set image deployment/<name> <container>=<image>` is faster than editing YAML
+# - Watch rollouts with `--watch` / `-w` rather than polling `get pods` repeatedly
+# - Remember: scaling and rolling updates are DIFFERENT operations with different blast radius
+# - `rollout undo` is itself a rollout - it respects maxSurge/maxUnavailable just like forward updates

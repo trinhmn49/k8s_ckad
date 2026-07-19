@@ -1,8 +1,21 @@
-# Lab 1.4 — Label & Annotation Drill
+# Lab 1.4 — Label & Annotation Drill (using the weather-alert project)
 # Duration: ~30 min | CKAD domain: Application Design and Build (20%)
 # Bulk-create Pods and update labels across many objects
 # Query resources with label selectors
 # Use --overwrite for label changes
+# Uses real weather-alert/user-service, alert-evaluator, and notification-dispatcher
+# images as standalone scale-test Pods - not generic busybox placeholders
+
+# ============================================================================
+# PREREQUISITE
+# ============================================================================
+# Requires the weather-alert namespace + backing services + all 3 images built
+# into minikube's Docker daemon (see weather-alert/README.md "Deploy to Minikube").
+# Verify: kubectl -n weather-alert get pods
+# postgres/redis/nats should already be Running.
+#
+# These 5 Pods are standalone (NOT managed by the real Deployments) so labeling
+# them is completely safe and won't affect the actual running project.
 
 # ============================================================================
 # DETAILED EXPLANATION
@@ -14,7 +27,7 @@
 #    - Key/value pairs used to IDENTIFY and SELECT objects
 #    - Consumed by selectors (Services, Deployments, NetworkPolicies, kubectl -l)
 #    - Small, indexed, queryable - keep them short and structured
-#    - Use case: app=web, tier=frontend, env=prod, version=v2
+#    - Use case: app=user-service, tier=api, env=prod, version=v2
 #
 # 2. ANNOTATIONS
 #    - Key/value pairs used to attach ARBITRARY METADATA
@@ -26,56 +39,80 @@
 #    - kubectl label fails with an error if the key already exists on the object
 #    - This is a safety guard against accidental relabeling
 #    - Pass --overwrite to explicitly confirm replacing an existing label's value
+#    - Real use case below: relabeling a Pod tier=canary mirrors how you'd mark
+#      one replica for a canary rollout without touching the others
 #
 # LABEL SELECTORS:
-#    - Equality-based: -l env=prod              (env must equal prod)
-#    - Inequality-based: -l env!=prod            (env must not equal prod)
-#    - Set-based: -l 'env in (prod,staging)'     (env is one of these)
-#    - Set-based: -l 'env notin (dev)'           (env is not this)
-#    - Existence: -l tier                        (tier key exists, any value)
-#    - Non-existence: -l '!tier'                 (tier key does NOT exist)
-#    - Combine with commas (AND logic): -l 'env=prod,tier=frontend'
+#    - Equality-based: -l tier=api                (tier must equal api)
+#    - Inequality-based: -l tier!=api              (tier must not equal api)
+#    - Set-based: -l 'tier in (api,worker)'        (tier is one of these)
+#    - Set-based: -l 'tier notin (dispatch)'       (tier is not this)
+#    - Existence: -l tier                          (tier key exists, any value)
+#    - Non-existence: -l '!tier'                   (tier key does NOT exist)
+#    - Combine with commas (AND logic): -l 'app=weather-alert-scale-demo,tier=api'
 #
 # ============================================================================
 
 # ============================================================================
-# STEP 1: Bulk-create Pods imperatively (loop, since kubectl has no native bulk-create)
+# STEP 1: Bulk-create standalone Pods from the project's real images
 # ============================================================================
 
-# Create 5 Pods with a shared base label but distinct names/tiers:
-kubectl run pod-1 --image=busybox:musl --labels="app=drill,tier=frontend" -- sleep 3600
-kubectl run pod-2 --image=busybox:musl --labels="app=drill,tier=frontend" -- sleep 3600
-kubectl run pod-3 --image=busybox:musl --labels="app=drill,tier=backend"  -- sleep 3600
-kubectl run pod-4 --image=busybox:musl --labels="app=drill,tier=backend"  -- sleep 3600
-kubectl run pod-5 --image=busybox:musl --labels="app=drill,tier=cache"    -- sleep 3600
+# 2 extra user-service replicas (tier=api):
+kubectl -n weather-alert run user-service-extra-1 \
+  --image=weather-alert/user-service:latest --image-pull-policy=Never \
+  --labels="app=weather-alert-scale-demo,tier=api" \
+  --env="PORT=8001,DB_HOST=postgres,DB_PORT=5432,DB_USER=weather_app,DB_PASSWORD=weather_app,DB_NAME=weather_alert,NATS_URL=nats://nats:4222"
+kubectl -n weather-alert run user-service-extra-2 \
+  --image=weather-alert/user-service:latest --image-pull-policy=Never \
+  --labels="app=weather-alert-scale-demo,tier=api" \
+  --env="PORT=8001,DB_HOST=postgres,DB_PORT=5432,DB_USER=weather_app,DB_PASSWORD=weather_app,DB_NAME=weather_alert,NATS_URL=nats://nats:4222"
 
-# Faster alternative using a shell loop:
-# for i in 1 2 3 4 5; do
-#   kubectl run pod-$i --image=busybox:musl --labels="app=drill" -- sleep 3600
-# done
+# 2 extra alert-evaluator replicas (tier=worker):
+kubectl -n weather-alert run alert-evaluator-extra-1 \
+  --image=weather-alert/alert-evaluator:latest --image-pull-policy=Never \
+  --labels="app=weather-alert-scale-demo,tier=worker" \
+  --env="PORT=8003,DB_HOST=postgres,DB_PORT=5432,DB_USER=weather_app,DB_PASSWORD=weather_app,DB_NAME=weather_alert,REDIS_URL=redis:6379,NATS_URL=nats://nats:4222"
+kubectl -n weather-alert run alert-evaluator-extra-2 \
+  --image=weather-alert/alert-evaluator:latest --image-pull-policy=Never \
+  --labels="app=weather-alert-scale-demo,tier=worker" \
+  --env="PORT=8003,DB_HOST=postgres,DB_PORT=5432,DB_USER=weather_app,DB_PASSWORD=weather_app,DB_NAME=weather_alert,REDIS_URL=redis:6379,NATS_URL=nats://nats:4222"
+
+# 1 extra notification-dispatcher replica (tier=dispatch):
+kubectl -n weather-alert run notification-dispatcher-extra-1 \
+  --image=weather-alert/notification-dispatcher:latest --image-pull-policy=Never \
+  --labels="app=weather-alert-scale-demo,tier=dispatch" \
+  --env="PORT=8004,DB_HOST=postgres,DB_PORT=5432,DB_USER=weather_app,DB_PASSWORD=weather_app,DB_NAME=weather_alert,NATS_URL=nats://nats:4222"
 
 # ============================================================================
-# STEP 2: Exported Pod manifest (reference shape - what each Pod looks like)
+# STEP 2: Reference manifest - shape of each Pod (user-service example)
 # ============================================================================
 ---
 apiVersion: v1
 kind: Pod
 metadata:
-  name: pod-1
+  name: user-service-extra-1
+  namespace: weather-alert
   labels:
-    app: drill
-    tier: frontend
+    app: weather-alert-scale-demo
+    tier: api
 spec:
   containers:
-  - name: pod-1
-    image: busybox:musl
-    command: ["sleep", "3600"]
+  - name: user-service-extra-1
+    image: weather-alert/user-service:latest
+    imagePullPolicy: Never
+    env:
+    - name: PORT
+      value: "8001"
+    - name: DB_HOST
+      value: postgres
+    - name: NATS_URL
+      value: nats://nats:4222
     resources:
       requests:
         cpu: 50m
         memory: 64Mi
       limits:
-        cpu: 100m
+        cpu: 250m
         memory: 128Mi
   restartPolicy: Always
 
@@ -83,80 +120,86 @@ spec:
 # STEP 3: Query resources with label selectors
 # ============================================================================
 
-# List all Pods with their labels shown:
-kubectl get pods --show-labels
+# List all scale-demo Pods with their labels shown:
+kubectl -n weather-alert get pods -l app=weather-alert-scale-demo --show-labels
 
-# Equality selector - only frontend tier:
-kubectl get pods -l tier=frontend
+# Equality selector - only api tier:
+kubectl -n weather-alert get pods -l tier=api
 
-# Inequality selector - everything except backend:
-kubectl get pods -l tier!=backend
+# Inequality selector - everything except worker:
+kubectl -n weather-alert get pods -l app=weather-alert-scale-demo,tier!=worker
 
-# Set-based selector - frontend OR cache:
-kubectl get pods -l 'tier in (frontend,cache)'
+# Set-based selector - api OR dispatch:
+kubectl -n weather-alert get pods -l 'tier in (api,dispatch)'
 
-# Combined AND selector - app=drill AND tier=backend:
-kubectl get pods -l 'app=drill,tier=backend'
+# Combined AND selector - app=weather-alert-scale-demo AND tier=worker:
+kubectl -n weather-alert get pods -l 'app=weather-alert-scale-demo,tier=worker'
 
 # Existence selector - any Pod that HAS a tier label:
-kubectl get pods -l tier
+kubectl -n weather-alert get pods -l app=weather-alert-scale-demo,tier
 
 # Use selector output as input to another command (common exam pattern):
-kubectl get pods -l tier=backend -o name
+kubectl -n weather-alert get pods -l tier=worker -o name
 
 # ============================================================================
 # STEP 4: Update labels across many objects with --overwrite
 # ============================================================================
 
-# Attempt to change tier on pod-1 WITHOUT --overwrite (this will FAIL):
-kubectl label pod pod-1 tier=edge
+# Attempt to change tier on user-service-extra-1 WITHOUT --overwrite (this will FAIL):
+kubectl -n weather-alert label pod user-service-extra-1 tier=canary
 # Error: 'tier' already has a value, must use --overwrite
 
-# Correct way - force the overwrite:
-kubectl label pod pod-1 tier=edge --overwrite
+# Correct way - mark this one replica as a canary:
+kubectl -n weather-alert label pod user-service-extra-1 tier=canary --overwrite
 
-# Bulk-update ALL Pods matching a selector at once (no loop needed):
-kubectl label pods -l app=drill env=lab --overwrite
-
-# Bulk-update using --all (every Pod in the namespace):
-kubectl label pods --all env=lab --overwrite
+# Bulk-update ALL scale-demo Pods matching a selector at once (no loop needed):
+kubectl -n weather-alert label pods -l app=weather-alert-scale-demo env=scale-test --overwrite
 
 # Add a NEW label (no --overwrite needed since key doesn't exist yet):
-kubectl label pods -l app=drill owner=student
+kubectl -n weather-alert label pods -l app=weather-alert-scale-demo owner=student
 
 # Remove a label entirely (trailing dash):
-kubectl label pods -l app=drill owner-
+kubectl -n weather-alert label pods -l app=weather-alert-scale-demo owner-
 
 # ============================================================================
 # STEP 5: Annotations (contrast with labels)
 # ============================================================================
 
 # Add an annotation (works the same way, also needs --overwrite to replace):
-kubectl annotate pods -l app=drill note="created for label drill" --overwrite
+kubectl -n weather-alert annotate pods -l app=weather-alert-scale-demo \
+  note="temporary scale-test pods, safe to delete" --overwrite
 
 # View annotations:
-kubectl get pod pod-1 -o jsonpath='{.metadata.annotations}'
+kubectl -n weather-alert get pod user-service-extra-1 -o jsonpath='{.metadata.annotations}'
 
 # Confirm annotations are NOT selectable (this returns nothing / errors):
-kubectl get pods -l note="created for label drill"
+kubectl -n weather-alert get pods -l note="temporary scale-test pods, safe to delete"
 
 # ============================================================================
 # STEP 6: Verification commands
 # ============================================================================
 
-# Confirm final label state across all Pods:
-kubectl get pods --show-labels
+# Confirm final label state across all scale-demo Pods:
+kubectl -n weather-alert get pods -l app=weather-alert-scale-demo --show-labels
 
 # Verify a specific label value via jsonpath:
-kubectl get pod pod-1 -o jsonpath='{.metadata.labels.tier}'
+kubectl -n weather-alert get pod user-service-extra-1 -o jsonpath='{.metadata.labels.tier}'
 
 # Count Pods matching a selector (exam speed trick):
-kubectl get pods -l env=lab --no-headers | wc -l
+kubectl -n weather-alert get pods -l env=scale-test --no-headers | wc -l
+
+# Confirm the REAL Deployment-managed Pods were never touched by any of this:
+kubectl -n weather-alert get pods -l app=user-service --show-labels
 
 # ============================================================================
 # CLEANUP
 # ============================================================================
-kubectl delete pods pod-1 pod-2 pod-3 pod-4 pod-5 --ignore-not-found
+# These are standalone Pods, separate from the real Deployments - safe to delete:
+kubectl -n weather-alert delete pods \
+  user-service-extra-1 user-service-extra-2 \
+  alert-evaluator-extra-1 alert-evaluator-extra-2 \
+  notification-dispatcher-extra-1 \
+  --ignore-not-found
 
 # ============================================================================
 # KEY CONCEPTS FOR CKAD EXAM
@@ -197,9 +240,16 @@ kubectl delete pods pod-1 pod-2 pod-3 pod-4 pod-5 --ignore-not-found
 # If bulk label update only changed one object:
 # - Confirm you used -l <selector> or --all, not a single object name
 #
+# If these standalone Pods interfere with real Deployment Pods in selectors:
+# - They won't - the real Deployments use app=user-service/app=alert-evaluator/etc.
+#   labels (no tier or scale-demo label), so -l app=weather-alert-scale-demo never
+#   matches them
+#
 # ============================================================================
 # EXAM TIPS:
 # - kubectl get pods --show-labels is the fastest way to audit current labels
 # - Combine selector + -o name to feed results into follow-up commands
 # - Trailing dash (key-) removes a label/annotation - easy to miss under time pressure
 # - --overwrite is required any time the key already exists, even bulk updates
+# - Relabeling a single replica (e.g. tier=canary) while leaving the rest alone is
+#   exactly how manual canary marking works before a Service selector change

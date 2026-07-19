@@ -1,8 +1,23 @@
-# Lab 1.3 — Jobs & CronJobs
+# Lab 1.3 — Jobs & CronJobs (using the weather-alert project)
 # Duration: ~45 min | CKAD domain: Application Design and Build (20%)
 # Run a one-off Job to completion with backoffLimit
 # Create a CronJob that spawns Jobs on a schedule
 # Distinguish Job/CronJob from Deployment
+# Uses postgres:15-alpine (the project's own backing-service image) running
+# real psql/pg_isready commands against the real weather_alert database -
+# not busybox echo placeholders
+
+# ============================================================================
+# PREREQUISITE
+# ============================================================================
+# Requires the weather-alert namespace + postgres already deployed and Running:
+#   kubectl apply -f ../../weather-alert/k8s/namespace.yaml
+#   kubectl apply -f ../../weather-alert/k8s/configmaps/
+#   kubectl apply -f ../../weather-alert/k8s/secrets/
+#   kubectl apply -f ../../weather-alert/k8s/backing-services/
+# Verify: kubectl -n weather-alert get pods -l app=postgres
+# (These Jobs reuse the postgres-init-schema ConfigMap already defined in
+#  weather-alert/k8s/backing-services/postgres.yaml)
 
 # ============================================================================
 # DETAILED EXPLANATION
@@ -14,19 +29,20 @@
 #    - Manages Pods meant to run FOREVER (restartPolicy: Always)
 #    - If a Pod dies, the ReplicaSet replaces it immediately
 #    - Scales via .spec.replicas
-#    - Use case: web servers, APIs, anything long-running
+#    - This is what weather-alert's user-service/weather-fetcher/etc. use
 #
 # 2. JOB
 #    - Manages Pods meant to run ONCE TO COMPLETION (restartPolicy: Never or OnFailure)
 #    - Pod exits 0  -> Job marked Complete, no more Pods created
 #    - Pod exits !=0 -> Job retries, up to .spec.backoffLimit times, then Failed
-#    - Use case: batch processing, migrations, one-off scripts
+#    - Real use case here: applying schema.sql is exactly this kind of one-off task
 #
 # 3. CRONJOB
 #    - A CronJob does NOT run Pods directly - it creates a new Job on a schedule
 #    - .spec.schedule uses standard cron syntax (5 fields: min hour dom month dow)
 #    - Each scheduled tick -> CronJob controller creates a fresh Job object
-#    - Use case: nightly backups, periodic cleanup, scheduled reports
+#    - Real use case here: periodically deleting old rows from notification_log,
+#      the same table notification-dispatcher writes to on every send attempt
 #
 # BACKOFF LIMIT MECHANICS:
 #    - .spec.backoffLimit (default 6) caps retry attempts on Pod failure
@@ -37,43 +53,37 @@
 # ============================================================================
 
 # ============================================================================
-# PART A: ONE-OFF JOB (with backoffLimit)
+# PART A: ONE-OFF JOB - apply the real schema (idempotent, safe to re-run)
 # ============================================================================
 
-# STEP 1: Create the Job imperatively
-# Command to run:
-kubectl create job data-processor \
-  --image=busybox:musl \
-  -- /bin/sh -c "echo 'Processing data...'; sleep 5; echo 'Done'"
+# STEP 1: Apply the Job (reuses the postgres-init-schema ConfigMap as a volume)
+kubectl apply -f one-off-job.yaml
 
 # ============================================================================
-# STEP 2: Export the Job manifest (dry-run for reference)
-kubectl create job data-processor \
-  --image=busybox:musl \
-  --dry-run=client -o yaml \
-  -- /bin/sh -c "echo 'Processing data...'; sleep 5; echo 'Done'"
-
-# ============================================================================
-# STEP 3: Exported Job Manifest (with backoffLimit added manually)
+# STEP 2: Job manifest (see one-off-job.yaml) - key points annotated:
 ---
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: data-processor
+  name: db-migrate
+  namespace: weather-alert
 spec:
   backoffLimit: 3          # Retry up to 3 times on failure before giving up
   template:
     spec:
       containers:
-      - name: data-processor
-        image: busybox:musl
+      - name: db-migrate
+        image: postgres:15-alpine
         command:
         - /bin/sh
         - -c
         - |
-          echo "Processing data..."
-          sleep 5
-          echo "Done"
+          echo "Applying schema (idempotent - CREATE TABLE IF NOT EXISTS)..."
+          psql "postgresql://weather_app:weather_app@postgres:5432/weather_alert" -f /migrations/schema.sql
+          echo "Schema apply complete"
+        volumeMounts:
+        - name: schema-vol
+          mountPath: /migrations
         resources:
           requests:
             cpu: 50m
@@ -81,72 +91,71 @@ spec:
           limits:
             cpu: 200m
             memory: 128Mi
+      volumes:
+      - name: schema-vol
+        configMap:
+          name: postgres-init-schema
       restartPolicy: Never   # Never or OnFailure required for Jobs
 
 # ============================================================================
-# STEP 4 (OPTIONAL): A FAILING job to observe backoffLimit exhaustion
+# STEP 3 (OPTIONAL): A FAILING job to observe backoffLimit exhaustion
+# See retry_job.yaml - points pg_isready at a host that doesn't exist:
+kubectl apply -f retry_job.yaml
 ---
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: always-fails
+  name: db-connection-check-fail
+  namespace: weather-alert
 spec:
   backoffLimit: 2           # Only 2 retries -> fails fast for demo purposes
   template:
     spec:
       containers:
-      - name: always-fails
-        image: busybox:musl
-        command: ["/bin/sh", "-c", "echo 'about to fail'; exit 1"]
+      - name: db-connection-check-fail
+        image: postgres:15-alpine
+        command: ["/bin/sh", "-c", "pg_isready -h postgres-wrong-host -p 5432 -U weather_app -t 2"]
       restartPolicy: Never
 
 # ============================================================================
-# STEP 5: Verification commands
+# STEP 4: Verification commands
 
 # Watch Job progress:
-kubectl get job data-processor -w
+kubectl -n weather-alert get job db-migrate -w
 
 # Check Job status (succeeded/failed counts):
-kubectl describe job data-processor
+kubectl -n weather-alert describe job db-migrate
 
 # View logs from the Job's Pod:
-kubectl logs job/data-processor
+kubectl -n weather-alert logs job/db-migrate
 
 # Confirm Job completed successfully:
-kubectl get job data-processor -o jsonpath='{.status.succeeded}'
+kubectl -n weather-alert get job db-migrate -o jsonpath='{.status.succeeded}'
+
+# Prove the schema was actually (re)applied - query the real database directly:
+kubectl -n weather-alert run psql-check --rm -it --restart=Never --image=postgres:15-alpine -- \
+  psql "postgresql://weather_app:weather_app@postgres:5432/weather_alert" \
+  -c "SELECT to_regclass('public.users'), to_regclass('public.notification_log');"
 
 # Watch the failing Job exhaust its backoffLimit:
-kubectl get job always-fails -w
-kubectl describe job always-fails
+kubectl -n weather-alert get job db-connection-check-fail -w
+kubectl -n weather-alert describe job db-connection-check-fail
 # Look for: Events -> "BackoffLimitExceeded"
 
 # ============================================================================
-# PART B: CRONJOB
+# PART B: CRONJOB - periodic notification_log cleanup
 # ============================================================================
 
-# STEP 1: Create the CronJob imperatively (runs every minute)
-kubectl create cronjob report-generator \
-  --image=busybox:musl \
-  --schedule="*/1 * * * *" \
-  -- /bin/sh -c "date; echo 'Generating report...'"
-
-# ============================================================================
-# STEP 2: Export the CronJob manifest (dry-run for reference)
-kubectl create cronjob report-generator \
-  --image=busybox:musl \
-  --schedule="*/1 * * * *" \
-  --dry-run=client -o yaml \
-  -- /bin/sh -c "date; echo 'Generating report...'"
-
-# ============================================================================
-# STEP 3: Exported CronJob Manifest (with history limits + backoffLimit added)
+# STEP 1: Apply the CronJob (see cron_job.yaml)
+kubectl apply -f cron_job.yaml
 ---
 apiVersion: batch/v1
 kind: CronJob
 metadata:
-  name: report-generator
+  name: notification-log-cleanup
+  namespace: weather-alert
 spec:
-  schedule: "*/1 * * * *"       # Every minute (min hour dom month dow)
+  schedule: "*/1 * * * *"       # Every minute for demo speed (real: daily, e.g. "0 3 * * *")
   concurrencyPolicy: Forbid     # Skip new run if previous still active
   successfulJobsHistoryLimit: 3 # Keep last 3 successful Jobs
   failedJobsHistoryLimit: 1     # Keep last 1 failed Job
@@ -156,41 +165,41 @@ spec:
       template:
         spec:
           containers:
-          - name: report-generator
-            image: busybox:musl
+          - name: notification-log-cleanup
+            image: postgres:15-alpine
             command:
             - /bin/sh
             - -c
             - |
-              date
-              echo "Generating report..."
+              psql "postgresql://weather_app:weather_app@postgres:5432/weather_alert" \
+                -c "DELETE FROM notification_log WHERE created_at < NOW() - INTERVAL '30 days';"
           restartPolicy: OnFailure
 
 # ============================================================================
-# STEP 4: Verification commands
+# STEP 2: Verification commands
 
 # List CronJobs (shows schedule, last-schedule time, active count):
-kubectl get cronjobs
+kubectl -n weather-alert get cronjobs
 
 # Watch new Jobs get created each minute:
-kubectl get jobs --watch
+kubectl -n weather-alert get jobs --watch
 
 # Describe the CronJob (shows last schedule/active Jobs):
-kubectl describe cronjob report-generator
+kubectl -n weather-alert describe cronjob notification-log-cleanup
 
 # View logs of the most recent Job spawned by the CronJob:
-kubectl logs -l job-name=$(kubectl get jobs \
+kubectl -n weather-alert logs -l job-name=$(kubectl -n weather-alert get jobs \
   --sort-by=.status.startTime \
   -o jsonpath='{.items[-1:].metadata.name}')
 
 # Manually trigger a CronJob run immediately (doesn't wait for schedule):
-kubectl create job manual-run --from=cronjob/report-generator
+kubectl -n weather-alert create job manual-cleanup-run --from=cronjob/notification-log-cleanup
 
 # ============================================================================
 # CLEANUP
 # ============================================================================
-kubectl delete job data-processor always-fails manual-run --ignore-not-found
-kubectl delete cronjob report-generator --ignore-not-found
+kubectl -n weather-alert delete job db-migrate db-connection-check-fail manual-cleanup-run --ignore-not-found
+kubectl -n weather-alert delete cronjob notification-log-cleanup --ignore-not-found
 
 # ============================================================================
 # KEY CONCEPTS FOR CKAD EXAM
@@ -212,30 +221,28 @@ kubectl delete cronjob report-generator --ignore-not-found
 #    - Deployment Pods: restartPolicy: Always (only valid option)
 #    - Job/CronJob Pods: restartPolicy: Never or OnFailure (Always is invalid)
 #
-# 4. QUICK IMPERATIVE COMMANDS:
-#    - kubectl create job <name> --image=<image> -- <command>
-#    - kubectl create cronjob <name> --image=<image> --schedule="<cron>" -- <command>
-#    - kubectl create job <name> --from=cronjob/<cronjob-name>  (manual trigger)
+# 4. MOUNTING A CONFIGMAP AS A FILE FOR A JOB:
+#    - db-migrate reuses the SAME postgres-init-schema ConfigMap that bootstraps
+#      the postgres Pod itself - one source of truth for the schema, two consumers
 #
 # ============================================================================
 # TROUBLESHOOTING
 # ============================================================================
 #
-# If Job stuck with 0/1 completions:
-# - kubectl describe job <name>        (check Events for image pull / scheduling errors)
-# - kubectl logs job/<name>            (check application-level failure)
+# If db-migrate stuck with 0/1 completions:
+# - kubectl -n weather-alert describe job db-migrate  (check Events for image pull / scheduling errors)
+# - kubectl -n weather-alert logs job/db-migrate       (check psql-level failure, e.g. bad connection string)
 #
-# If Job shows "BackoffLimitExceeded":
-# - Container is exiting non-zero every attempt
-# - Fix the command/image, or the failure is expected (check backoffLimit is intentional)
+# If db-migrate fails with a connection error:
+# - Confirm postgres is actually Running: kubectl -n weather-alert get pods -l app=postgres
+#
+# If db-connection-check-fail does NOT show BackoffLimitExceeded:
+# - pg_isready may have gotten lucky with DNS caching - confirm the host is really wrong:
+#   kubectl -n weather-alert exec job/db-connection-check-fail -- nslookup postgres-wrong-host
 #
 # If CronJob never creates Jobs:
-# - Verify schedule syntax: kubectl get cronjob <name> -o yaml | grep schedule
+# - Verify schedule syntax: kubectl -n weather-alert get cronjob notification-log-cleanup -o yaml | grep schedule
 # - Check concurrencyPolicy: Forbid + a stuck previous Job blocks new runs
-# - Check cluster time / CronJob controller is running (kube-controller-manager)
-#
-# If old Jobs pile up:
-# - Tune successfulJobsHistoryLimit / failedJobsHistoryLimit lower
 #
 # ============================================================================
 # EXAM TIPS:
@@ -243,3 +250,5 @@ kubectl delete cronjob report-generator --ignore-not-found
 # - Use --dry-run=client -o yaml to generate a base manifest, then edit backoffLimit etc.
 # - "Run to completion" = Job; "on a schedule" = CronJob; "always running" = Deployment
 # - restartPolicy: Always is INVALID for Job/CronJob Pod templates - exam gotcha
+# - Mounting an existing ConfigMap into a one-off Job (instead of duplicating its
+#   content inline) is a realistic, examinable pattern for migration/maintenance Jobs

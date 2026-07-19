@@ -1,0 +1,208 @@
+# Lab 2.2 — Services & DNS-Based Service Discovery
+# Duration: ~45 min | CKAD domain: Services and Networking (20%)
+# Understand how weather-alert's 4 microservices find "postgres", "redis", "nats"
+# by name alone, with no IP addresses hardcoded anywhere
+# Reproduce and diagnose a real "backend unreachable" incident on purpose
+# Learn the DNS -> Endpoints -> app-logs troubleshooting order
+
+# ============================================================================
+# PREREQUISITE
+# ============================================================================
+# Full weather-alert stack deployed and healthy in the "weather-alert" namespace:
+#   kubectl -n weather-alert get pods
+# All Pods should be Running. This lab is based on a real incident from building
+# this project: alert-evaluator logged "nats: no servers available for connection"
+# because its Pod started before the nats Service had a Ready backend.
+
+# ============================================================================
+# DETAILED EXPLANATION
+# ============================================================================
+#
+# WHY SERVICE NAMES WORK AS HOSTNAMES
+#
+#    Every ClusterIP Service gets a DNS record via CoreDNS/kube-dns:
+#        <service-name>.<namespace>.svc.cluster.local
+#    From a Pod in the SAME namespace, the short name alone resolves:
+#        nats            -> nats.weather-alert.svc.cluster.local
+#    From a Pod in a DIFFERENT namespace, you need at least:
+#        nats.weather-alert
+#
+#    This is exactly why weather-alert's ConfigMap (app-config) can set:
+#        NATS_URL: "nats://nats:4222"
+#        DB_HOST:  "postgres"
+#        REDIS_URL: "redis:6379"
+#    with no IPs anywhere - Kubernetes DNS resolves the Service name to its
+#    stable ClusterIP, which load-balances across whatever Pods are Ready.
+#
+# SERVICE -> ENDPOINTS -> POD CHAIN
+#
+#    Service (stable name + ClusterIP - this never changes)
+#        |
+#        v  populated from
+#    Endpoints / EndpointSlice (list of Ready Pod IPs behind the Service)
+#        |
+#        v  backed by
+#    Pod (actual IP, changes every time the Pod is recreated)
+#
+#    - A Service with NO Ready backend Pods has an EMPTY Endpoints object
+#    - DNS resolution still SUCCEEDS (the Service name/IP exists) even with
+#      zero Endpoints - the connection just fails or hangs, which is exactly
+#      the "no servers available for connection" symptom from the real incident
+#    - This is the #1 exam/production gotcha: DNS working ≠ backend reachable
+#
+# ============================================================================
+
+# ============================================================================
+# STEP 1: Inspect existing Services and their DNS names
+# ============================================================================
+
+kubectl -n weather-alert get svc
+
+# Full DNS name pattern for any Service:
+kubectl -n weather-alert get svc nats -o jsonpath='{.metadata.name}.{.metadata.namespace}.svc.cluster.local{"\n"}'
+
+# ============================================================================
+# STEP 2: Verify DNS resolution from inside the cluster
+# ============================================================================
+
+# Launch a throwaway debug Pod in the SAME namespace:
+kubectl -n weather-alert run dns-test --rm -it --restart=Never --image=busybox:musl -- \
+  nslookup nats
+
+# Short name resolves because the debug Pod is in the same namespace.
+# Try the fully-qualified form too (works from ANY namespace):
+kubectl -n weather-alert run dns-test2 --rm -it --restart=Never --image=busybox:musl -- \
+  nslookup nats.weather-alert.svc.cluster.local
+
+# ============================================================================
+# STEP 3: Verify actual TCP reachability (DNS success ≠ port open)
+# ============================================================================
+
+kubectl -n weather-alert run net-test --rm -it --restart=Never --image=busybox:musl -- \
+  sh -c "nc -zv nats 4222 && nc -zv postgres 5432 && nc -zv redis 6379"
+
+# ============================================================================
+# STEP 4: Inspect Endpoints - the missing link between Service and Pods
+# ============================================================================
+
+# Healthy state: Endpoints lists one IP:port per Ready Pod
+kubectl -n weather-alert get endpoints nats
+kubectl -n weather-alert describe endpoints nats
+
+# Compare against the actual Pod IP:
+kubectl -n weather-alert get pods -l app=nats -o wide
+
+# ============================================================================
+# STEP 5: Reproduce the real incident on purpose
+# ============================================================================
+
+# Scale nats to 0 - the Service still exists, DNS still resolves,
+# but Endpoints becomes EMPTY:
+kubectl -n weather-alert scale deployment nats --replicas=0
+
+kubectl -n weather-alert get endpoints nats
+# -> <none>   (this is the "backend unreachable" state)
+
+# DNS still resolves even with zero backends - proving DNS success alone
+# doesn't mean the service is usable:
+kubectl -n weather-alert run dns-test3 --rm -it --restart=Never --image=busybox:musl -- \
+  nslookup nats
+
+# Watch alert-evaluator (and the other NATS-dependent services) react.
+# Because these services use nats.RetryOnFailedConnect + MaxReconnects(-1)
+# (see weather-alert/*/cmd/server/main.go), they log and keep retrying
+# instead of crash-looping:
+kubectl -n weather-alert logs deployment/alert-evaluator --tail=20 -f
+# Expect repeated "NATS disconnected" / reconnect attempts, no pod restarts
+
+# ============================================================================
+# STEP 6: Recover and confirm self-healing
+# ============================================================================
+
+kubectl -n weather-alert scale deployment nats --replicas=1
+
+kubectl -n weather-alert rollout status deployment/nats
+
+# Endpoints repopulates automatically once the new nats Pod passes readiness:
+kubectl -n weather-alert get endpoints nats
+
+# The already-running alert-evaluator Pod reconnects WITHOUT restarting -
+# watch for the ReconnectHandler's log line:
+kubectl -n weather-alert logs deployment/alert-evaluator --tail=20 -f
+# Expect: "✓ NATS connected"
+
+# Confirm no Pods actually crashed during the outage:
+kubectl -n weather-alert get pods -l app=alert-evaluator
+# RESTARTS column should still be 0 (or unchanged from before the test)
+
+# ============================================================================
+# STEP 7: Verification commands
+# ============================================================================
+
+# Full health check across every service after recovery:
+kubectl -n weather-alert get pods,svc,endpoints
+
+# End-to-end confirmation the pipeline works again:
+kubectl -n weather-alert port-forward svc/alert-evaluator 8003:8003 &
+curl http://localhost:8003/api/v1/stats
+
+# ============================================================================
+# CLEANUP
+# ============================================================================
+# (Nothing to clean up - nats was scaled back to 1 in Step 6. Kill any
+# lingering port-forward background jobs from Step 7 with `kill %1` etc.)
+
+# ============================================================================
+# KEY CONCEPTS FOR CKAD EXAM
+# ============================================================================
+#
+# 1. DNS NAME FORMATS:
+#    - <service>                                  -> same namespace only
+#    - <service>.<namespace>                       -> any namespace
+#    - <service>.<namespace>.svc.cluster.local      -> fully qualified, any namespace
+#
+# 2. SERVICE TYPES (quick reference):
+#    - ClusterIP    -> internal-only, stable virtual IP (weather-alert uses this for all 4 apps + backing services)
+#    - NodePort     -> ClusterIP + exposed on every Node's IP at a static port
+#    - LoadBalancer -> NodePort + cloud provider provisions an external LB
+#    - ExternalName -> CNAME-style redirect to an external DNS name, no proxying
+#
+# 3. TROUBLESHOOTING ORDER FOR "CAN'T REACH SERVICE X":
+#    a. Does the Service exist and have the expected port?  kubectl get svc
+#    b. Does DNS resolve it?                                  nslookup <service>
+#    c. Does it have Ready Endpoints?                         kubectl get endpoints <service>
+#    d. Is the port actually open on the Pod?                 nc -zv <service> <port>
+#    e. Only then look at NetworkPolicy or application logs
+#
+# 4. WHY RetryOnFailedConnect MATTERS IN KUBERNETES:
+#    - Deployments have NO built-in "wait for dependency" (unlike docker-compose's
+#      depends_on: condition: service_healthy)
+#    - A Pod that crash-loops on first connection failure fights a race against
+#      its dependencies every single restart
+#    - Client-side retry/reconnect logic is the standard fix, not manifest ordering
+#
+# ============================================================================
+# TROUBLESHOOTING
+# ============================================================================
+#
+# If nslookup fails entirely (not just empty Endpoints):
+# - Check CoreDNS is running: kubectl -n kube-system get pods -l k8s-app=kube-dns
+# - Confirm the Pod's dnsPolicy wasn't overridden to something unusual
+#
+# If Endpoints stays empty after scaling back up:
+# - Check the new Pod's readinessProbe is actually passing:
+#   kubectl -n weather-alert describe pod -l app=nats
+# - A Pod stuck NotReady never gets added to Endpoints, by design
+#
+# If a dependent service still logs connection errors after nats recovers:
+# - Check ReconnectWait/MaxReconnects settings - client may still be backing off
+# - Confirm you're tailing logs from the CURRENT pod, not a stale one:
+#   kubectl -n weather-alert get pods -l app=alert-evaluator
+#
+# ============================================================================
+# EXAM TIPS:
+# - `kubectl run <name> --rm -it --restart=Never --image=busybox:musl -- <cmd>` is the
+#   fastest disposable debug-pod pattern - no manifest needed, auto-deleted on exit
+# - Endpoints (or EndpointSlice on newer clusters) is the single most useful object
+#   for "is this Service actually backed by anything right now"
+# - DNS resolving successfully is NOT proof a Service is usable - always check Endpoints too
