@@ -42,6 +42,16 @@ spec:
                 secretKeyRef:
                   name: app-secrets
                   key: APNS_TEAM_ID
+            - name: TELEGRAM_BOT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: app-secrets
+                  key: TELEGRAM_BOT_TOKEN
+            - name: TELEGRAM_CHAT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: app-secrets
+                  key: TELEGRAM_CHAT_ID
           envFrom:
             - configMapRef:
                 name: app-config
