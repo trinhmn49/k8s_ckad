@@ -3,25 +3,6 @@
 # Create a Pod imperatively with labels, environment variables, and resource requests/limits
 # Export a manifest using --dry-run=client -o yaml
 # Verify Pod state without opening an editor (exam speed path)
-# Uses the real weather-alert/user-service image - not a generic nginx/busybox placeholder
-
-# ============================================================================
-# PREREQUISITE
-# ============================================================================
-# This lab creates a standalone Pod running the ACTUAL user-service binary from
-# this repo's weather-alert/ project, alongside its already-deployed backing
-# services (Postgres/Redis/NATS) in the "weather-alert" namespace:
-#   kubectl apply -f ../weather-alert/k8s/namespace.yaml
-#   kubectl apply -f ../weather-alert/k8s/configmaps/
-#   kubectl apply -f ../weather-alert/k8s/secrets/
-#   kubectl apply -f ../weather-alert/k8s/backing-services/
-# The image must be built into minikube's own Docker daemon first (from WSL):
-#   eval $(minikube docker-env)
-#   docker build -t weather-alert/user-service:latest -f user-service/Dockerfile .
-# (run from the weather-alert/ directory)
-# Verify prerequisites:
-#   kubectl -n weather-alert get pods
-# postgres/redis/nats should be Running before starting this lab.
 
 # ============================================================================
 # SOLUTION

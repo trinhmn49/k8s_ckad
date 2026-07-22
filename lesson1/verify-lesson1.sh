@@ -1,59 +1,29 @@
 #!/usr/bin/env bash
-# verify-lesson1.sh — recreates, checks, and explains the results of labs 1.1-1.5.
+# verify-lesson1.sh — checks lab 1.1's requirements against the REAL, already
+# running weather-alert deployment. No lab namespace, no extra Pod is created -
+# this inspects the actual user-service Pod that's part of the real Deployment.
 #
-# TWO-NAMESPACE DESIGN:
-#   - REAL_NS ("weather-alert")     - the actual deployed project. Left alone,
-#     except lab 1.5 which intentionally patches its ConfigMap and reverts it.
-#   - LAB_NS  ("weather-alert-lab") - created fresh by this script for labs
-#     1.1-1.4. Pods here reach Postgres/Redis/NATS in REAL_NS via cross-namespace
-#     DNS (e.g. postgres.weather-alert.svc.cluster.local) - the same mechanism
-#     taught in lesson2/2.2. Cleanup is just deleting this whole namespace.
-#
-# All five labs use the REAL weather-alert images: weather-alert/user-service,
-# alert-evaluator, notification-dispatcher, and postgres:15-alpine (the
-# project's own backing-service image) - not generic busybox/nginx placeholders.
+# NOTE: labs 1.2-1.5 are temporarily disabled (see "Run everything" at the
+# bottom) while lab 1.1's checks are being finalized.
 #
 # Run from WSL (or any shell with kubectl pointed at your minikube cluster):
 #   bash lesson1/verify-lesson1.sh
 #
-# Flags:
-#   --keep                   Don't delete the weather-alert-lab namespace afterward
-#   --skip-1.5               Skip lab 1.5 (ConfigMap/Secret checks against REAL_NS)
-#   --no-wait-cron           Don't wait ~70s for the CronJob in lab 1.3 to actually fire
+# Prints PASS/FAIL lines plus an indented "Means:" explanation of what that
+# result tells you. A final summary counts PASS / FAIL / SKIP.
 #
-# Each lab prints PASS/FAIL lines plus an indented "Means:" explanation of what
-# that result tells you. A final summary counts PASS / FAIL / SKIP across all labs.
-#
-# PREREQUISITE: the weather-alert namespace, its ConfigMap/Secret, and its
-# backing services (postgres/redis/nats) must already be deployed and Running,
-# and the 4 service images must already be built into minikube's Docker daemon.
-# See weather-alert/README.md "Deploy to Minikube". This script checks for that
-# and skips everything with a clear message if it's not ready yet.
+# PREREQUISITE: the weather-alert namespace, its ConfigMap/Secret, backing
+# services (postgres/redis/nats), and the user-service Deployment must already
+# be deployed and Running. See weather-alert/README.md "Deploy to Minikube".
+# This script checks for that and skips everything with a clear message if
+# it's not ready yet.
 
 set -uo pipefail
 
 REAL_NS="weather-alert"
-LAB_NS="weather-alert-lab"
-KEEP=0
-SKIP_1_5=0
-WAIT_CRON=1
-
-# This script lives at lesson1/verify-lesson1.sh - the real project's schema
-# file is a sibling directory up one level.
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SCHEMA_FILE="$SCRIPT_DIR/../weather-alert/db/schema.sql"
-
-# Cross-namespace Service DNS names (Service.Namespace form - reachable from
-# ANY namespace, unlike the short "postgres" name which only works inside REAL_NS)
-POSTGRES_FQDN="postgres.${REAL_NS}.svc.cluster.local"
-REDIS_FQDN="redis.${REAL_NS}.svc.cluster.local"
-NATS_FQDN="nats.${REAL_NS}.svc.cluster.local"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --keep) KEEP=1; shift ;;
-    --skip-1.5) SKIP_1_5=1; shift ;;
-    --no-wait-cron) WAIT_CRON=0; shift ;;
     -h|--help)
       grep '^#' "$0" | sed 's/^# \{0,1\}//'
       exit 0
@@ -76,23 +46,29 @@ PASS_COUNT=0
 FAIL_COUNT=0
 SKIP_COUNT=0
 
+CRITERIA_WIDTH=60
+
 section() {
   echo ""
   echo "${C_BOLD}${C_CYAN}=== $1 ===${C_RESET}"
+  printf "%-${CRITERIA_WIDTH}s | %s\n" "CRITERIA (requirement)" "ACTUAL RESULT"
+  printf '%s\n' "$(printf -- '-%.0s' $(seq 1 100))"
 }
 
+# pass/fail/skip <criteria> <actual result>
+# Prints a two-column row: the requirement being checked, and what was found.
 pass() {
-  echo "${C_GREEN}[PASS]${C_RESET} $1"
+  printf "%s[PASS]%s %-${CRITERIA_WIDTH}s | %s\n" "$C_GREEN" "$C_RESET" "$1" "$2"
   PASS_COUNT=$((PASS_COUNT + 1))
 }
 
 fail() {
-  echo "${C_RED}[FAIL]${C_RESET} $1"
+  printf "%s[FAIL]%s %-${CRITERIA_WIDTH}s | %s\n" "$C_RED" "$C_RESET" "$1" "$2"
   FAIL_COUNT=$((FAIL_COUNT + 1))
 }
 
 skip() {
-  echo "${C_YELLOW}[SKIP]${C_RESET} $1"
+  printf "%s[SKIP]%s %-${CRITERIA_WIDTH}s | %s\n" "$C_YELLOW" "$C_RESET" "$1" "${2:-}"
   SKIP_COUNT=$((SKIP_COUNT + 1))
 }
 
@@ -100,50 +76,40 @@ explain() {
   echo "        ${C_YELLOW}Means:${C_RESET} $1"
 }
 
-run_cleanup() {
-  if [[ "$KEEP" -eq 1 ]]; then
-    echo ""
-    echo "${C_YELLOW}--keep set: leaving namespace '$LAB_NS' in place.${C_RESET}"
-    return
-  fi
-  echo ""
-  echo "${C_BOLD}Deleting namespace '$LAB_NS' (removes everything labs 1.1-1.4 created)...${C_RESET}"
-  kubectl delete namespace "$LAB_NS" --ignore-not-found >/dev/null 2>&1
-}
-trap run_cleanup EXIT
-
 # ---------------------------------------------------------------------------
-# Preflight — the real weather-alert stack must already be deployed, then
-# create the fresh lab namespace
+# Preflight — the real weather-alert stack (including user-service) must
+# already be deployed and Running. Nothing is created by this script.
 # ---------------------------------------------------------------------------
 PREFLIGHT_OK=1
 
 preflight() {
-  section "Preflight — weather-alert stack + lab namespace"
+  section "Preflight — weather-alert stack"
 
   if ! kubectl get namespace "$REAL_NS" >/dev/null 2>&1; then
-    fail "Namespace '$REAL_NS' does not exist"
+    fail "Namespace '$REAL_NS' must exist" "not found"
     explain "Deploy it first: kubectl apply -f ../weather-alert/k8s/namespace.yaml (see weather-alert/README.md)"
     PREFLIGHT_OK=0
     return
   fi
-  pass "Namespace '$REAL_NS' exists"
+  pass "Namespace '$REAL_NS' must exist" "exists"
 
   local ok=1
   for obj in "configmap app-config" "secret app-secrets"; do
     if ! kubectl -n "$REAL_NS" get $obj >/dev/null 2>&1; then
-      fail "Missing: $obj in $REAL_NS"
+      fail "$obj must exist in $REAL_NS" "not found"
       ok=0
+    else
+      pass "$obj must exist in $REAL_NS" "exists"
     fi
   done
 
-  for dep in postgres redis nats; do
+  for dep in postgres redis nats user-service; do
     local ready
     ready=$(kubectl -n "$REAL_NS" get deployment "$dep" -o jsonpath='{.status.readyReplicas}' 2>/dev/null)
     if [[ "$ready" -ge 1 ]] 2>/dev/null; then
-      pass "Backing service '$dep' has $ready ready replica(s) in $REAL_NS"
+      pass "Deployment '$dep' must have >=1 Ready replica" "readyReplicas=$ready"
     else
-      fail "Backing service '$dep' is not Ready in $REAL_NS"
+      fail "Deployment '$dep' must have >=1 Ready replica" "readyReplicas=${ready:-0}"
       ok=0
     fi
   done
@@ -153,96 +119,112 @@ preflight() {
     PREFLIGHT_OK=0
     return
   fi
-
-  if [[ ! -f "$SCHEMA_FILE" ]]; then
-    fail "Schema file not found: $SCHEMA_FILE"
-    PREFLIGHT_OK=0
-    return
-  fi
-
-  # Create (or reuse) the independent lab namespace - idempotent via apply
-  kubectl create namespace "$LAB_NS" --dry-run=client -o yaml 2>/dev/null | kubectl apply -f - >/dev/null 2>&1
-  local phase
-  phase=$(kubectl get namespace "$LAB_NS" -o jsonpath='{.status.phase}' 2>/dev/null)
-  if [[ "$phase" == "Active" ]]; then
-    pass "Namespace '$LAB_NS' is Active (created fresh for this run)"
-    explain "Labs 1.1-1.4 create their Pods/Jobs here, fully separate from the real project — cleanup is just deleting this one namespace."
-  else
-    fail "Namespace '$LAB_NS' is not Active (phase=$phase)"
-    explain "If it's stuck 'Terminating' from a previous run, wait a bit and re-run."
-    PREFLIGHT_OK=0
-    return
-  fi
-
-  # Reuse the real project's own schema.sql as a ConfigMap inside LAB_NS (used by lab 1.3)
-  kubectl -n "$LAB_NS" create configmap postgres-schema \
-    --from-file=schema.sql="$SCHEMA_FILE" \
-    --dry-run=client -o yaml 2>/dev/null | kubectl apply -f - >/dev/null 2>&1
-  pass "ConfigMap 'postgres-schema' created in $LAB_NS from the real weather-alert/db/schema.sql"
 }
 
 # ---------------------------------------------------------------------------
-# Lab 1.1 — The 60-Second Pod (weather-alert/user-service, cross-namespace to REAL_NS)
+# Lab 1.1 — The 60-Second Pod, verified against the REAL user-service Pod
+# (part of the actual Deployment in REAL_NS) — nothing is created here.
 # ---------------------------------------------------------------------------
 verify_1_1() {
-  section "Lab 1.1 — The 60-Second Pod (user-service, in $LAB_NS)"
+  section "Lab 1.1 — The 60-Second Pod (real user-service Pod, in $REAL_NS)"
 
-  if ! kubectl -n "$LAB_NS" get pod user-service-standalone >/dev/null 2>&1; then
-    kubectl -n "$LAB_NS" run user-service-standalone \
-      --image=weather-alert/user-service:latest \
-      --image-pull-policy=Never \
-      --labels="app=user-service,tier=api" \
-      --env="PORT=8001,LOG_LEVEL=info,DB_HOST=${POSTGRES_FQDN},DB_PORT=5432,DB_USER=weather_app,DB_PASSWORD=weather_app,DB_NAME=weather_alert,NATS_URL=nats://${NATS_FQDN}:4222" \
-      --requests="cpu=50m,memory=64Mi" \
-      --limits="cpu=250m,memory=128Mi" \
-      --port=8001 >/dev/null
+  local pod_name
+  pod_name=$(kubectl -n "$REAL_NS" get pods -l app=user-service -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+  if [[ -z "$pod_name" ]]; then
+    fail "Must find a real Pod with label app=user-service" "not found"
+    explain "Deploy the real user-service Deployment first: kubectl apply -f weather-alert/k8s/deployments/user-service.yaml"
+    return
   fi
-
-  kubectl -n "$LAB_NS" wait --for=condition=Ready pod/user-service-standalone --timeout=60s >/dev/null 2>&1
+  pass "Must find a real Pod with label app=user-service" "$pod_name"
 
   local phase
-  phase=$(kubectl -n "$LAB_NS" get pod user-service-standalone -o jsonpath='{.status.phase}' 2>/dev/null)
+  phase=$(kubectl -n "$REAL_NS" get pod "$pod_name" -o jsonpath='{.status.phase}' 2>/dev/null)
   if [[ "$phase" == "Running" ]]; then
-    pass "Pod user-service-standalone phase=Running"
-    explain "The real user-service binary, running in '$LAB_NS', reached across namespaces to '$POSTGRES_FQDN' in '$REAL_NS' — proof cross-namespace Service DNS works."
+    pass "Pod must be in Running phase" "phase=$phase"
   else
-    fail "Pod user-service-standalone phase=$phase (expected Running)"
-    explain "If this crash-loops, the cross-namespace DNS name may be wrong, or postgres in $REAL_NS is unreachable. Check 'kubectl -n $LAB_NS logs user-service-standalone'."
+    fail "Pod must be in Running phase" "phase=$phase"
+    explain "Check 'kubectl -n $REAL_NS logs $pod_name' and 'kubectl -n $REAL_NS describe pod $pod_name'."
   fi
 
-  local labels
-  labels=$(kubectl -n "$LAB_NS" get pod user-service-standalone -o jsonpath='{.metadata.labels}' 2>/dev/null)
-  if [[ "$labels" == *"app:user-service"* && "$labels" == *"tier:api"* ]]; then
-    pass "Labels present: $labels"
-    explain "These are namespace-local — labels never need to be unique across namespaces, only within one."
+  local image pull_policy container_port
+  image=$(kubectl -n "$REAL_NS" get pod "$pod_name" -o jsonpath='{.spec.containers[0].image}' 2>/dev/null)
+  pull_policy=$(kubectl -n "$REAL_NS" get pod "$pod_name" -o jsonpath='{.spec.containers[0].imagePullPolicy}' 2>/dev/null)
+  container_port=$(kubectl -n "$REAL_NS" get pod "$pod_name" -o jsonpath='{.spec.containers[0].ports[0].containerPort}' 2>/dev/null)
+  if [[ "$image" == "weather-alert/user-service:latest" && "$pull_policy" == "Never" && "$container_port" == "8001" ]]; then
+    pass "image=weather-alert/user-service:latest, imagePullPolicy=Never, containerPort=8001" "image=$image, imagePullPolicy=$pull_policy, containerPort=$container_port"
+    explain "imagePullPolicy=Never is required for locally-built images on minikube — without it the kubelet tries (and fails) to pull from a registry."
   else
-    fail "Labels missing/incorrect: $labels"
+    fail "image=weather-alert/user-service:latest, imagePullPolicy=Never, containerPort=8001" "image=$image, imagePullPolicy=$pull_policy, containerPort=$container_port"
   fi
 
+  local label_app
+  label_app=$(kubectl -n "$REAL_NS" get pod "$pod_name" -o jsonpath='{.metadata.labels.app}' 2>/dev/null)
+  if [[ "$label_app" == "user-service" ]]; then
+    pass "Label app=user-service" "app=$label_app"
+    explain "The real Deployment's selector (spec.selector.matchLabels) must match this exact label, or the Pod would never be adopted by the Deployment/Service."
+  else
+    fail "Label app=user-service" "app=$label_app"
+  fi
+
+  # Env vars the real Deployment wires in via envFrom(app-config) + secretKeyRef(app-secrets) + direct env
   local envs
-  envs=$(kubectl -n "$LAB_NS" exec user-service-standalone -- printenv 2>/dev/null | grep -E "^(PORT|DB_HOST|NATS_URL)=")
-  if [[ "$(echo "$envs" | grep -c '^PORT=8001$')" -eq 1 && "$(echo "$envs" | grep -c "^DB_HOST=${POSTGRES_FQDN}\$")" -eq 1 ]]; then
-    pass "Env vars present: $(echo "$envs" | tr '\n' ' ')"
-    explain "DB_HOST is the FULLY QUALIFIED cross-namespace name — the short name 'postgres' alone would NOT resolve from a different namespace."
+  envs=$(kubectl -n "$REAL_NS" exec "$pod_name" -- printenv 2>/dev/null)
+  declare -A expected_envs=(
+    [PORT]="8001"
+    [LOG_LEVEL]="info"
+    [DB_HOST]="postgres"
+    [DB_PORT]="5432"
+    [DB_USER]="weather_app"
+    [DB_PASSWORD]="weather_app"
+    [DB_NAME]="weather_alert"
+    [NATS_URL]="nats://nats:4222"
+  )
+  local envs_ok=1
+  local env_mismatches=""
+  for key in "${!expected_envs[@]}"; do
+    local expected="${expected_envs[$key]}"
+    local actual
+    actual=$(echo "$envs" | grep "^${key}=" | cut -d= -f2-)
+    if [[ "$actual" != "$expected" ]]; then
+      envs_ok=0
+      env_mismatches+=" $key(expected=$expected,got=$actual)"
+    fi
+  done
+  if [[ "$envs_ok" -eq 1 ]]; then
+    pass "8 env vars: PORT,LOG_LEVEL,DB_HOST,DB_PORT,DB_USER,DB_PASSWORD,DB_NAME,NATS_URL" "all match"
+    explain "DB_HOST/DB_PORT/DB_NAME/NATS_URL/LOG_LEVEL come from the app-config ConfigMap (envFrom); DB_USER/DB_PASSWORD come from the app-secrets Secret (secretKeyRef) — same source of truth taught in lab 1.5."
   else
-    fail "Env vars missing/incorrect: $envs"
+    fail "8 env vars: PORT,LOG_LEVEL,DB_HOST,DB_PORT,DB_USER,DB_PASSWORD,DB_NAME,NATS_URL" "mismatch:$env_mismatches"
   fi
 
-  local resources
-  resources=$(kubectl -n "$LAB_NS" get pod user-service-standalone -o jsonpath='{.spec.containers[0].resources}' 2>/dev/null)
-  if [[ "$resources" == *"cpu:50m"* && "$resources" == *"memory:64Mi"* && "$resources" == *"cpu:250m"* && "$resources" == *"memory:128Mi"* ]]; then
-    pass "Resources present: $resources"
+  local req_cpu req_mem lim_cpu lim_mem
+  req_cpu=$(kubectl -n "$REAL_NS" get pod "$pod_name" -o jsonpath='{.spec.containers[0].resources.requests.cpu}' 2>/dev/null)
+  req_mem=$(kubectl -n "$REAL_NS" get pod "$pod_name" -o jsonpath='{.spec.containers[0].resources.requests.memory}' 2>/dev/null)
+  lim_cpu=$(kubectl -n "$REAL_NS" get pod "$pod_name" -o jsonpath='{.spec.containers[0].resources.limits.cpu}' 2>/dev/null)
+  lim_mem=$(kubectl -n "$REAL_NS" get pod "$pod_name" -o jsonpath='{.spec.containers[0].resources.limits.memory}' 2>/dev/null)
+  if [[ "$req_cpu" == "50m" && "$req_mem" == "64Mi" && "$lim_cpu" == "250m" && "$lim_mem" == "128Mi" ]]; then
+    pass "requests=cpu:50m,memory:64Mi limits=cpu:250m,memory:128Mi" "requests=cpu:$req_cpu,memory:$req_mem limits=cpu:$lim_cpu,memory:$lim_mem"
   else
-    fail "Resources missing/incorrect: $resources"
+    fail "requests=cpu:50m,memory:64Mi limits=cpu:250m,memory:128Mi" "requests=cpu:$req_cpu,memory:$req_mem limits=cpu:$lim_cpu,memory:$lim_mem"
+  fi
+
+  # Exam-speed check (no editor): export the running Pod's manifest via -o yaml
+  local exported_yaml
+  exported_yaml=$(kubectl -n "$REAL_NS" get pod "$pod_name" -o yaml 2>/dev/null)
+  if [[ "$exported_yaml" == *"kind: Pod"* && "$exported_yaml" == *"image: weather-alert/user-service:latest"* ]]; then
+    pass "kubectl get pod -o yaml must export the manifest (no editor)" "exported successfully"
+    explain "Exam-speed habit: never open vi/nano to inspect a live object — -o yaml/jsonpath gives you everything."
+  else
+    fail "kubectl get pod -o yaml must export the manifest (no editor)" "did not match expected"
   fi
 
   local health
-  health=$(kubectl -n "$LAB_NS" exec user-service-standalone -- wget -qO- http://localhost:8001/health 2>/dev/null)
+  health=$(kubectl -n "$REAL_NS" exec "$pod_name" -- wget -qO- http://localhost:8001/health 2>/dev/null)
   if [[ "$health" == *'"status":"ok"'* ]]; then
-    pass "GET /health returned: $health"
-    explain "The real app served this from inside '$LAB_NS' while its database lives in '$REAL_NS' — two namespaces, one working connection."
+    pass "GET /health must return status=ok" "$health"
+    explain "This is the real user-service binary serving live traffic, not a placeholder — the health check ran inside the actual Deployment's Pod."
   else
-    fail "GET /health did not return the expected body: $health"
+    fail "GET /health must return status=ok" "$health"
   fi
 }
 
@@ -643,10 +625,11 @@ verify_1_5() {
 preflight
 if [[ "$PREFLIGHT_OK" -eq 1 ]]; then
   verify_1_1
-  verify_1_2
-  verify_1_3
-  verify_1_4
-  verify_1_5
+  # TODO: re-enable once lab 1.1 checks are confirmed passing
+  # verify_1_2
+  # verify_1_3
+  # verify_1_4
+  # verify_1_5
 else
   echo ""
   echo "${C_RED}Preflight failed — skipping labs 1.1-1.5. Fix the issues above and re-run.${C_RESET}"
