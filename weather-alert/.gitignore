@@ -39,3 +39,5 @@ vendor/
 # Go mod cache
 go.sum.*
 go.mod.*
+
+k8s/secrets/app-secrets.yaml
