@@ -1,11 +1,8 @@
-# Lab 1.3 — Jobs & CronJobs (using the weather-alert project)
+# Lab 1.3 — Jobs & CronJobs
 # Duration: ~45 min | CKAD domain: Application Design and Build (20%)
 # Run a one-off Job to completion with backoffLimit
 # Create a CronJob that spawns Jobs on a schedule
 # Distinguish Job/CronJob from Deployment
-# Uses postgres:15-alpine (the project's own backing-service image) running
-# real psql/pg_isready commands against the real weather_alert database -
-# not busybox echo placeholders
 
 # ============================================================================
 # PREREQUISITE

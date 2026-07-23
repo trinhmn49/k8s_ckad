@@ -1,3 +1,9 @@
+# Lab 1.2 — Init + Sidecar Pattern
+# Duration: ~60 min | CKAD domain: Application Design and Build (20%)
+# Build a multi-container Pod with init container, app container, and sidecar
+# Share data via emptyDir volume
+# Tail application logs from sidecar using kubectl logs -c
+
 apiVersion: v1
 kind: Pod
 metadata:

@@ -1,0 +1,208 @@
+# Lab 2.3 — Scale & HPA
+# Duration: ~45 min | CKAD domain: Application Deployment (20%)
+# Manually scale a Deployment to 10 replicas
+# Configure a HorizontalPodAutoscaler at 50% CPU target
+# Uses the real weather-alert/user-service Deployment - not a generic
+# nginx/busybox placeholder
+
+# ============================================================================
+# PREREQUISITE
+# ============================================================================
+# 1. weather-alert namespace + user-service Deployment already running:
+#      kubectl -n weather-alert get deployment user-service
+#    Should show 2/2 READY.
+#
+# 2. HPA needs the metrics-server addon (reads live CPU/memory usage) -
+#    NOT installed by default on minikube:
+#      minikube addons enable metrics-server
+#    Verify it's working (may take ~1 min after enabling before this returns data):
+#      kubectl -n weather-alert top pods
+
+# ============================================================================
+# DETAILED EXPLANATION
+# ============================================================================
+#
+# MANUAL SCALING vs HPA
+#    - Manual: `kubectl scale` sets an exact, fixed .spec.replicas - it stays
+#      there until a human (or script) changes it again
+#    - HPA: a separate object that WATCHES a metric and adjusts
+#      .spec.replicas on your behalf, between minReplicas/maxReplicas
+#    - If both are used together, the HPA controller wins - it overwrites
+#      .spec.replicas on its own schedule, so manual `kubectl scale` calls
+#      against an HPA-managed Deployment get reverted on the next HPA sync
+#
+# HOW HPA COMPUTES "50% CPU":
+#    - Percentage is relative to the container's CPU REQUEST, not an
+#      absolute value - user-service requests cpu: 50m, so:
+#        50% target -> HPA aims to keep average usage around 25m/Pod
+#        Above that -> scale out (more Pods, same average work per Pod)
+#        Below that -> scale in (after a stabilization window)
+#    - This is why every container MUST have resources.requests.cpu set -
+#      no request means HPA has nothing to compute a percentage against
+#
+# SCALE-UP vs SCALE-DOWN BEHAVIOR:
+#    - Scale-up reacts fairly quickly (default ~15s sync period, immediate
+#      once threshold is crossed)
+#    - Scale-down is intentionally conservative (default 5 min stabilization
+#      window) to avoid flapping - don't expect instant scale-in after
+#      stopping load
+#
+# ============================================================================
+
+# ============================================================================
+# STEP 1: Manually scale to 10 replicas
+# ============================================================================
+
+kubectl -n weather-alert scale deployment user-service --replicas=10
+
+kubectl -n weather-alert get pods -l app=user-service -w
+# (Ctrl+C once all 10 are Running/Ready)
+
+kubectl -n weather-alert get deployment user-service
+# READY should show 10/10
+
+# Confirm the Service already load-balances across all 10 (no Service edit needed):
+kubectl -n weather-alert get endpoints user-service \
+  -o jsonpath='{.subsets[0].addresses[*].ip}' | tr ' ' '\n' | wc -l
+
+# ============================================================================
+# STEP 2: Scale back down to a normal baseline before adding the HPA
+# ============================================================================
+# (An HPA immediately starts adjusting replicas once created - start from a
+# small, known baseline so its first decision is easy to observe.)
+
+kubectl -n weather-alert scale deployment user-service --replicas=2
+kubectl -n weather-alert rollout status deployment/user-service
+
+# ============================================================================
+# STEP 3: Create the HorizontalPodAutoscaler at 50% CPU target
+# ============================================================================
+# Imperative (exam speed path):
+kubectl -n weather-alert autoscale deployment user-service \
+  --cpu-percent=50 --min=2 --max=10
+
+# Equivalent declarative manifest (see hpa.yaml) - useful when you need
+# multiple metrics or finer control than the imperative flags allow:
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: user-service
+  namespace: weather-alert
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: user-service
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 50
+
+# ============================================================================
+# STEP 4: Watch the HPA read metrics and hold steady under no load
+# ============================================================================
+
+kubectl -n weather-alert get hpa user-service -w
+# TARGETS column shows current/target, e.g. "3%/50%" - REPLICAS stays at
+# minReplicas (2) since there's no load yet
+# (Ctrl+C to stop watching)
+
+kubectl -n weather-alert describe hpa user-service
+
+# ============================================================================
+# STEP 5: Generate load and watch it scale OUT
+# ============================================================================
+
+# A few parallel disposable load-generator Pods hammering /health - enough
+# concurrent requests to push CPU usage above the 50% target:
+for i in 1 2 3 4; do
+  kubectl -n weather-alert run load-generator-$i --image=busybox:musl --restart=Never -- \
+    /bin/sh -c "while true; do wget -q -O- http://user-service:8001/health >/dev/null; done"
+done
+
+# Watch TARGETS climb and REPLICAS increase (poll every ~15-30s):
+kubectl -n weather-alert get hpa user-service -w
+
+# ============================================================================
+# STEP 6: Remove load, watch it scale back IN (takes several minutes)
+# ============================================================================
+
+kubectl -n weather-alert delete pod load-generator-1 load-generator-2 load-generator-3 load-generator-4 --ignore-not-found
+
+# Scale-down is deliberately slow (default 5 min stabilization window) -
+# this WILL take longer than the scale-up did, that's expected, not a bug:
+kubectl -n weather-alert get hpa user-service -w
+
+# ============================================================================
+# STEP 7: Verification commands
+# ============================================================================
+
+kubectl -n weather-alert get hpa user-service
+kubectl -n weather-alert get hpa user-service -o jsonpath='{.spec.minReplicas} {.spec.maxReplicas} {.spec.metrics[0].resource.target.averageUtilization}{"\n"}'
+kubectl -n weather-alert describe hpa user-service | grep -A5 Events:
+
+# ============================================================================
+# CLEANUP
+# ============================================================================
+kubectl -n weather-alert delete hpa user-service --ignore-not-found
+kubectl -n weather-alert delete pod load-generator-1 load-generator-2 load-generator-3 load-generator-4 --ignore-not-found
+kubectl -n weather-alert scale deployment user-service --replicas=2
+kubectl -n weather-alert rollout status deployment/user-service
+
+# ============================================================================
+# KEY CONCEPTS FOR CKAD EXAM
+# ============================================================================
+#
+# 1. HPA REQUIRES resources.requests SET:
+#    - CPU/memory percentage targets are computed against the REQUEST value
+#    - No request on the container = HPA has nothing to divide by
+#
+# 2. IMPERATIVE SHORTCUT:
+#    - kubectl autoscale deployment <name> --cpu-percent=N --min=X --max=Y
+#      is the fast exam path; use --dry-run=client -o yaml to preview first
+#
+# 3. HPA vs MANUAL SCALE CONFLICT:
+#    - Once an HPA targets a Deployment, manual `kubectl scale` calls get
+#      overwritten on the next HPA reconcile - delete the HPA first if you
+#      need to manually pin the replica count
+#
+# 4. autoscaling/v2 vs v1:
+#    - v2 supports multiple metrics (CPU, memory, custom/external) and
+#      per-metric target types - v1 (autoscaling/v1) only supports CPU
+#
+# ============================================================================
+# TROUBLESHOOTING
+# ============================================================================
+#
+# If `kubectl get hpa` shows TARGETS as "<unknown>/50%":
+# - metrics-server isn't returning data yet - confirm it's enabled and running:
+#   minikube addons enable metrics-server
+#   kubectl -n kube-system get pods -l k8s-app=metrics-server
+# - Give it 1-2 minutes after enabling before expecting real numbers
+#
+# If REPLICAS never increases despite load:
+# - Confirm the container actually has resources.requests.cpu set:
+#   kubectl -n weather-alert get deployment user-service -o jsonpath='{.spec.template.spec.containers[0].resources}'
+# - Confirm load-generator Pods are actually Running, not CrashLoopBackOff
+# - A single lightweight /health handler may not push CPU high enough -
+#   add more parallel load-generator Pods if TARGETS stays low
+#
+# If REPLICAS doesn't scale back down after removing load:
+# - This is expected for several minutes (default stabilization window) -
+#   not a bug, just wait
+#
+# ============================================================================
+# EXAM TIPS:
+# - `kubectl autoscale` is the fastest way to create an HPA - know the flag
+#   names (--cpu-percent, --min, --max) cold
+# - `kubectl get hpa -w` is the single best way to watch scaling decisions live
+# - Remember: HPA changes .spec.replicas the same way `kubectl scale` does -
+#   it does NOT bypass readinessProbe-gated rollout behavior for new Pods
+# - Always check metrics-server is enabled BEFORE troubleshooting "HPA isn't
+#   scaling" - it's the #1 reason TARGETS shows <unknown>

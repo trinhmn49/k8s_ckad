@@ -1,29 +1,46 @@
 #!/usr/bin/env bash
-# verify-lesson1.sh — checks lab 1.1's requirements against the REAL, already
-# running weather-alert deployment. No lab namespace, no extra Pod is created -
-# this inspects the actual user-service Pod that's part of the real Deployment.
+# verify-lesson1.sh — checks labs 1.1-1.4's requirements against the REAL
+# weather-alert deployment/namespace. No lab namespace is created.
 #
-# NOTE: labs 1.2-1.5 are temporarily disabled (see "Run everything" at the
-# bottom) while lab 1.1's checks are being finalized.
+# Labs 1.1/1.2 only INSPECT already-running Pods (user-service,
+# notification-dispatcher) - nothing is created or deleted.
+#
+# Labs 1.3/1.4 are different: Jobs/CronJobs run-to-completion and lab 1.4's
+# Pods are standalone scale-test replicas, so there's no pre-existing object
+# to inspect. Both create their real objects directly in the real
+# "weather-alert" namespace (exactly as lesson1/1.3 and 1.4's own reference
+# YAML do - short "postgres"/"nats"/"redis" DNS names, no lab namespace), then
+# delete them at the end so the namespace is left as it was found. Lab 1.3's
+# CronJob DELETE only ever targets notification_log rows older than 30 days -
+# safe against real data. Lab 1.4's Pods carry no app=user-service/etc. label,
+# so they can never be matched by the real Deployments' selectors.
+#
+# NOTE: lab 1.5 is temporarily disabled (see "Run everything" at the bottom)
+# while labs 1.1-1.4's checks are being finalized.
 #
 # Run from WSL (or any shell with kubectl pointed at your minikube cluster):
 #   bash lesson1/verify-lesson1.sh
+#
+# Flags:
+#   --no-wait-cron           Don't wait ~70s for lab 1.3's CronJob to actually fire
 #
 # Prints PASS/FAIL lines plus an indented "Means:" explanation of what that
 # result tells you. A final summary counts PASS / FAIL / SKIP.
 #
 # PREREQUISITE: the weather-alert namespace, its ConfigMap/Secret, backing
-# services (postgres/redis/nats), and the user-service Deployment must already
-# be deployed and Running. See weather-alert/README.md "Deploy to Minikube".
-# This script checks for that and skips everything with a clear message if
-# it's not ready yet.
+# services (postgres/redis/nats), and the user-service + notification-dispatcher
+# Deployments must already be deployed and Running. See weather-alert/README.md
+# "Deploy to Minikube". This script checks for that and skips everything with
+# a clear message if it's not ready yet.
 
 set -uo pipefail
 
 REAL_NS="weather-alert"
+WAIT_CRON=1
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --no-wait-cron) WAIT_CRON=0; shift ;;
     -h|--help)
       grep '^#' "$0" | sed 's/^# \{0,1\}//'
       exit 0
@@ -103,7 +120,7 @@ preflight() {
     fi
   done
 
-  for dep in postgres redis nats user-service; do
+  for dep in postgres redis nats user-service notification-dispatcher; do
     local ready
     ready=$(kubectl -n "$REAL_NS" get deployment "$dep" -o jsonpath='{.status.readyReplicas}' 2>/dev/null)
     if [[ "$ready" -ge 1 ]] 2>/dev/null; then
@@ -229,123 +246,90 @@ verify_1_1() {
 }
 
 # ---------------------------------------------------------------------------
-# Lab 1.2 — Init + Sidecar Pattern (notification-dispatcher, in LAB_NS)
+# Lab 1.2 — Init + Sidecar Pattern, verified against the REAL notification-
+# dispatcher Pod (part of the actual Deployment in REAL_NS) — nothing created.
 # ---------------------------------------------------------------------------
 verify_1_2() {
-  section "Lab 1.2 — Init + Sidecar Pattern (notification-dispatcher, in $LAB_NS)"
+  section "Lab 1.2 — Init + Sidecar Pattern (real notification-dispatcher Pod, in $REAL_NS)"
 
-  if ! kubectl -n "$LAB_NS" get pod notification-dispatcher-guarded >/dev/null 2>&1; then
-    cat <<EOF | kubectl -n "$LAB_NS" apply -f - >/dev/null
-apiVersion: v1
-kind: Pod
-metadata:
-  name: notification-dispatcher-guarded
-  labels:
-    app: notification-dispatcher
-    pattern: init-sidecar
-spec:
-  volumes:
-  - name: apns-secret-vol
-    emptyDir: {}
-  initContainers:
-  - name: wait-for-postgres
-    image: postgres:15-alpine
-    command: ["/bin/sh", "-c", "until pg_isready -h ${POSTGRES_FQDN} -p 5432 -U weather_app; do sleep 2; done; echo LAB-PLACEHOLDER-APNS-KEY-CONTENT > /run/secrets/apns-key.p8"]
-    volumeMounts:
-    - name: apns-secret-vol
-      mountPath: /run/secrets
-  containers:
-  - name: dispatcher
-    image: weather-alert/notification-dispatcher:latest
-    imagePullPolicy: Never
-    ports:
-    - containerPort: 8004
-    env:
-    - name: PORT
-      value: "8004"
-    - name: LOG_LEVEL
-      value: info
-    - name: DB_HOST
-      value: "${POSTGRES_FQDN}"
-    - name: DB_PORT
-      value: "5432"
-    - name: DB_USER
-      value: weather_app
-    - name: DB_PASSWORD
-      value: weather_app
-    - name: DB_NAME
-      value: weather_alert
-    - name: NATS_URL
-      value: "nats://${NATS_FQDN}:4222"
-    - name: APNS_KEY_PATH
-      value: /run/secrets/apns-key.p8
-    volumeMounts:
-    - name: apns-secret-vol
-      mountPath: /run/secrets
-      readOnly: true
-    resources:
-      requests: {cpu: 50m, memory: 64Mi}
-      limits: {cpu: 250m, memory: 128Mi}
-  - name: health-monitor
-    image: postgres:15-alpine
-    command: ["/bin/sh", "-c", "while true; do wget -qO- http://localhost:8004/health && echo ' -- healthy' || echo 'not reachable yet'; sleep 10; done"]
-    resources:
-      requests: {cpu: 25m, memory: 32Mi}
-      limits: {cpu: 100m, memory: 64Mi}
-  restartPolicy: Always
-EOF
+  local pod_name
+  pod_name=$(kubectl -n "$REAL_NS" get pods -l app=notification-dispatcher -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+  if [[ -z "$pod_name" ]]; then
+    fail "Must find a real Pod with label app=notification-dispatcher" "not found"
+    explain "Deploy the real notification-dispatcher Deployment first: kubectl apply -f weather-alert/k8s/deployments/notification-dispatcher.yaml"
+    return
+  fi
+  pass "Must find a real Pod with label app=notification-dispatcher" "$pod_name"
+
+  local phase
+  phase=$(kubectl -n "$REAL_NS" get pod "$pod_name" -o jsonpath='{.status.phase}' 2>/dev/null)
+  if [[ "$phase" == "Running" ]]; then
+    pass "Pod must be in Running phase" "phase=$phase"
+  else
+    fail "Pod must be in Running phase" "phase=$phase"
+    explain "Check 'kubectl -n $REAL_NS logs $pod_name -c check-config' and 'kubectl -n $REAL_NS describe pod $pod_name'."
   fi
 
-  kubectl -n "$LAB_NS" wait --for=condition=Ready pod/notification-dispatcher-guarded --timeout=90s >/dev/null 2>&1
-
-  local init_reason
-  init_reason=$(kubectl -n "$LAB_NS" get pod notification-dispatcher-guarded -o jsonpath='{.status.initContainerStatuses[0].state.terminated.reason}' 2>/dev/null)
-  if [[ "$init_reason" == "Completed" ]]; then
-    pass "Init container 'wait-for-postgres' terminated with reason=Completed"
-    explain "It blocked on real pg_isready checks against '${POSTGRES_FQDN}' in a DIFFERENT namespace until Postgres was reachable, then staged the placeholder APNs key file."
+  local init_name init_reason
+  init_name=$(kubectl -n "$REAL_NS" get pod "$pod_name" -o jsonpath='{.spec.initContainers[0].name}' 2>/dev/null)
+  init_reason=$(kubectl -n "$REAL_NS" get pod "$pod_name" -o jsonpath='{.status.initContainerStatuses[0].state.terminated.reason}' 2>/dev/null)
+  if [[ "$init_name" == "check-config" && "$init_reason" == "Completed" ]]; then
+    pass "Init container 'check-config' must terminate with reason=Completed" "name=$init_name, reason=$init_reason"
+    explain "It validated DB_USER/DB_PASSWORD/APNS_KEY_ID/APNS_TEAM_ID were all non-empty before the main container was allowed to start — fail-fast on bad config instead of crash-looping later."
   else
-    fail "Init container state: $init_reason (expected Completed)"
-    explain "If this never completes, check the cross-namespace DNS name resolves: kubectl -n $LAB_NS run dns-check --rm -it --restart=Never --image=postgres:15-alpine -- nslookup ${POSTGRES_FQDN}"
+    fail "Init container 'check-config' must terminate with reason=Completed" "name=$init_name, reason=$init_reason"
+    explain "Check 'kubectl -n $REAL_NS logs $pod_name -c check-config' for which var was reported missing."
   fi
 
   local ready_count
-  ready_count=$(kubectl -n "$LAB_NS" get pod notification-dispatcher-guarded -o jsonpath='{range .status.containerStatuses[*]}{.ready}{" "}{end}' 2>/dev/null | grep -o true | wc -l)
+  ready_count=$(kubectl -n "$REAL_NS" get pod "$pod_name" -o jsonpath='{range .status.containerStatuses[*]}{.ready}{" "}{end}' 2>/dev/null | grep -o true | wc -l)
   if [[ "$ready_count" -eq 2 ]]; then
-    pass "Both regular containers (dispatcher, health-monitor) are Ready"
+    pass "Both regular containers (notification-dispatcher, health-monitor) must be Ready" "ready_count=$ready_count"
   else
-    fail "Expected 2 ready containers, got $ready_count"
+    fail "Both regular containers (notification-dispatcher, health-monitor) must be Ready" "ready_count=$ready_count"
   fi
 
-  local key_contents
-  key_contents=$(kubectl -n "$LAB_NS" exec notification-dispatcher-guarded -c dispatcher -- cat /run/secrets/apns-key.p8 2>/dev/null)
-  if [[ "$key_contents" == *"LAB-PLACEHOLDER-APNS-KEY-CONTENT"* ]]; then
-    pass "App container can read the file the init container staged: $key_contents"
-    explain "emptyDir sharing works the same regardless of which namespace the Pod lives in — it's purely local to the Pod."
+  # emptyDir sharing: the init container wrote a status file only the main
+  # container should be able to read back — proves the volume hand-off worked.
+  local status_contents
+  status_contents=$(kubectl -n "$REAL_NS" exec "$pod_name" -c notification-dispatcher -- cat /status/config-check 2>/dev/null)
+  if [[ "$status_contents" == *"config-check-passed"* ]]; then
+    pass "Main container must read the status file staged by the init container via emptyDir" "$status_contents"
+    explain "The init container and main container don't share a filesystem by default — the emptyDir volume mounted at /status in both is what lets the init container hand off proof of its work."
   else
-    fail "App container could not read the staged key file: $key_contents"
+    fail "Main container must read the status file staged by the init container via emptyDir" "$status_contents"
   fi
 
   local sidecar_check
-  sidecar_check=$(kubectl -n "$LAB_NS" exec notification-dispatcher-guarded -c health-monitor -- wget -qO- http://localhost:8004/health 2>/dev/null)
+  sidecar_check=$(kubectl -n "$REAL_NS" exec "$pod_name" -c health-monitor -- wget -qO- http://localhost:8004/health 2>/dev/null)
   if [[ "$sidecar_check" == *'"status":"ok"'* ]]; then
-    pass "Sidecar reached the app via localhost:8004 -> $sidecar_check"
+    pass "Sidecar must reach the app via localhost:8004" "$sidecar_check"
+    explain "All containers in a Pod share one network namespace — the sidecar hits localhost:8004, never the Pod's own DNS name."
   else
-    fail "Sidecar could not reach the app over localhost: $sidecar_check"
+    fail "Sidecar must reach the app via localhost:8004" "$sidecar_check"
   fi
 }
 
 # ---------------------------------------------------------------------------
-# Lab 1.3 — Jobs & CronJobs (postgres:15-alpine, in LAB_NS, cross-namespace to REAL_NS)
+# Lab 1.3 — Jobs & CronJobs, run as REAL Job/CronJob objects directly in
+# REAL_NS against the real database (matching lesson1/1.3's own reference
+# YAML exactly - short "postgres" DNS name, no lab namespace). Cleaned up
+# at the end so the namespace is left as it was found.
 # ---------------------------------------------------------------------------
 verify_1_3() {
-  section "Lab 1.3 — Jobs & CronJobs (in $LAB_NS, targeting postgres in $REAL_NS)"
+  section "Lab 1.3 — Jobs & CronJobs (real Job/CronJob objects in $REAL_NS)"
 
-  if ! kubectl -n "$LAB_NS" get job db-migrate >/dev/null 2>&1; then
-    kubectl -n "$LAB_NS" apply -f - >/dev/null <<EOF
+  # Clean slate in case a previous run didn't finish cleanup
+  kubectl -n "$REAL_NS" delete job db-migrate db-connection-check-fail --ignore-not-found >/dev/null 2>&1
+  kubectl -n "$REAL_NS" delete cronjob notification-log-cleanup --ignore-not-found >/dev/null 2>&1
+
+  # --- Part A: db-migrate (idempotent CREATE TABLE IF NOT EXISTS against the real DB) ---
+  kubectl -n "$REAL_NS" apply -f - >/dev/null <<EOF
 apiVersion: batch/v1
 kind: Job
 metadata:
   name: db-migrate
+  namespace: $REAL_NS
 spec:
   backoffLimit: 3
   template:
@@ -353,24 +337,45 @@ spec:
       containers:
       - name: db-migrate
         image: postgres:15-alpine
-        command: ["/bin/sh", "-c", "psql postgresql://weather_app:weather_app@${POSTGRES_FQDN}:5432/weather_alert -f /migrations/schema.sql"]
+        command: ["/bin/sh", "-c", "psql postgresql://weather_app:weather_app@postgres:5432/weather_alert -f /migrations/schema.sql"]
         volumeMounts:
         - name: schema-vol
           mountPath: /migrations
       volumes:
       - name: schema-vol
         configMap:
-          name: postgres-schema
+          name: postgres-init-schema
       restartPolicy: Never
 EOF
+
+  kubectl -n "$REAL_NS" wait --for=condition=Complete job/db-migrate --timeout=60s >/dev/null 2>&1
+  local succeeded
+  succeeded=$(kubectl -n "$REAL_NS" get job db-migrate -o jsonpath='{.status.succeeded}' 2>/dev/null)
+  if [[ "$succeeded" == "1" ]]; then
+    pass "Job db-migrate must complete with status.succeeded=1" "succeeded=$succeeded"
+    explain "Applied schema.sql (idempotent CREATE TABLE IF NOT EXISTS) directly against the real database in $REAL_NS, reusing the same postgres-init-schema ConfigMap that bootstraps the postgres Pod itself."
+  else
+    fail "Job db-migrate must complete with status.succeeded=1" "succeeded=${succeeded:-0}"
+    explain "Check 'kubectl -n $REAL_NS logs job/db-migrate' for the actual psql error."
   fi
 
-  if ! kubectl -n "$LAB_NS" get job db-connection-check-fail >/dev/null 2>&1; then
-    kubectl -n "$LAB_NS" apply -f - >/dev/null <<EOF
+  local table_check
+  table_check=$(kubectl -n "$REAL_NS" run psql-check-$$ --rm -i --restart=Never --image=postgres:15-alpine -- \
+    psql "postgresql://weather_app:weather_app@postgres:5432/weather_alert" -tAc \
+    "SELECT to_regclass('public.users') IS NOT NULL AND to_regclass('public.notification_log') IS NOT NULL;" 2>/dev/null)
+  if [[ "$table_check" == *"t"* ]]; then
+    pass "Real tables 'users' and 'notification_log' must exist in the database" "found"
+  else
+    fail "Real tables 'users' and 'notification_log' must exist in the database" "result=$table_check"
+  fi
+
+  # --- db-connection-check-fail: should exhaust backoffLimit ---
+  kubectl -n "$REAL_NS" apply -f - >/dev/null <<EOF
 apiVersion: batch/v1
 kind: Job
 metadata:
   name: db-connection-check-fail
+  namespace: $REAL_NS
 spec:
   backoffLimit: 2
   template:
@@ -378,17 +383,34 @@ spec:
       containers:
       - name: db-connection-check-fail
         image: postgres:15-alpine
-        command: ["/bin/sh", "-c", "pg_isready -h postgres-wrong-host.${REAL_NS}.svc.cluster.local -p 5432 -U weather_app -t 2"]
+        command: ["/bin/sh", "-c", "pg_isready -h postgres-wrong-host -p 5432 -U weather_app -t 2"]
       restartPolicy: Never
 EOF
+
+  echo "        Waiting up to 60s for db-connection-check-fail to exhaust backoffLimit..."
+  local waited=0
+  local failed_reason=""
+  while [[ $waited -lt 60 ]]; do
+    failed_reason=$(kubectl -n "$REAL_NS" get job db-connection-check-fail -o jsonpath='{.status.conditions[?(@.type=="Failed")].reason}' 2>/dev/null)
+    [[ -n "$failed_reason" ]] && break
+    sleep 5
+    waited=$((waited + 5))
+  done
+  if [[ "$failed_reason" == "BackoffLimitExceeded" ]]; then
+    pass "Job db-connection-check-fail must fail with reason=BackoffLimitExceeded" "reason=$failed_reason"
+    explain "postgres-wrong-host doesn't exist, so pg_isready fails every attempt; after backoffLimit=2 retries the Job gave up permanently."
+  else
+    skip "Job db-connection-check-fail must fail with reason=BackoffLimitExceeded" "reason='${failed_reason:-not set yet}'"
+    explain "backoffLimit retries use exponential backoff — re-run this script in a bit if this looks unfinished."
   fi
 
-  if ! kubectl -n "$LAB_NS" get cronjob notification-log-cleanup >/dev/null 2>&1; then
-    kubectl -n "$LAB_NS" apply -f - >/dev/null <<EOF
+  # --- Part B: notification-log-cleanup CronJob ---
+  kubectl -n "$REAL_NS" apply -f - >/dev/null <<EOF
 apiVersion: batch/v1
 kind: CronJob
 metadata:
   name: notification-log-cleanup
+  namespace: $REAL_NS
 spec:
   schedule: "*/1 * * * *"
   concurrencyPolicy: Forbid
@@ -402,81 +424,54 @@ spec:
           containers:
           - name: notification-log-cleanup
             image: postgres:15-alpine
-            command: ["/bin/sh", "-c", "psql postgresql://weather_app:weather_app@${POSTGRES_FQDN}:5432/weather_alert -c \"DELETE FROM notification_log WHERE created_at < NOW() - INTERVAL '30 days';\""]
+            command: ["/bin/sh", "-c", "psql postgresql://weather_app:weather_app@postgres:5432/weather_alert -c \"DELETE FROM notification_log WHERE created_at < NOW() - INTERVAL '30 days';\""]
           restartPolicy: OnFailure
 EOF
-  fi
 
-  # --- db-migrate: should succeed and actually create the real tables ---
-  kubectl -n "$LAB_NS" wait --for=condition=Complete job/db-migrate --timeout=60s >/dev/null 2>&1
-  local succeeded
-  succeeded=$(kubectl -n "$LAB_NS" get job db-migrate -o jsonpath='{.status.succeeded}' 2>/dev/null)
-  if [[ "$succeeded" == "1" ]]; then
-    pass "Job db-migrate: status.succeeded=1"
-    explain "This Job ran in '$LAB_NS' but applied schema.sql to the real database over in '$REAL_NS' via cross-namespace DNS — Jobs work identically regardless of namespace."
-  else
-    fail "Job db-migrate: status.succeeded=$succeeded (expected 1)"
-    explain "Check 'kubectl -n $LAB_NS logs job/db-migrate' for the actual psql error."
-  fi
-
-  local table_check
-  table_check=$(kubectl -n "$LAB_NS" run psql-check-$$ --rm -i --restart=Never --image=postgres:15-alpine -- \
-    psql "postgresql://weather_app:weather_app@${POSTGRES_FQDN}:5432/weather_alert" -tAc \
-    "SELECT to_regclass('public.users') IS NOT NULL AND to_regclass('public.notification_log') IS NOT NULL;" 2>/dev/null)
-  if [[ "$table_check" == *"t"* ]]; then
-    pass "Real tables 'users' and 'notification_log' exist in the database"
-  else
-    fail "Expected tables not found (result: $table_check)"
-  fi
-
-  # --- db-connection-check-fail: should exhaust backoffLimit ---
-  sleep 20
-  local failed_reason
-  failed_reason=$(kubectl -n "$LAB_NS" get job db-connection-check-fail -o jsonpath='{.status.conditions[?(@.type=="Failed")].reason}' 2>/dev/null)
-  if [[ "$failed_reason" == "BackoffLimitExceeded" ]]; then
-    pass "Job db-connection-check-fail: Failed condition reason=BackoffLimitExceeded"
-    explain "The hostname doesn't exist in EITHER namespace, so pg_isready fails every attempt; after backoffLimit=2 retries the Job gave up permanently."
-  else
-    skip "Job db-connection-check-fail: Failed condition not yet set (reason='$failed_reason')"
-    explain "backoffLimit retries use exponential backoff — re-run this script in a bit if this looks unfinished."
-  fi
-
-  # --- notification-log-cleanup CronJob ---
   local schedule
-  schedule=$(kubectl -n "$LAB_NS" get cronjob notification-log-cleanup -o jsonpath='{.spec.schedule}' 2>/dev/null)
+  schedule=$(kubectl -n "$REAL_NS" get cronjob notification-log-cleanup -o jsonpath='{.spec.schedule}' 2>/dev/null)
   if [[ "$schedule" == "*/1 * * * *" ]]; then
-    pass "CronJob notification-log-cleanup: schedule=$schedule"
+    pass "CronJob notification-log-cleanup schedule must be */1 * * * *" "schedule=$schedule"
   else
-    fail "CronJob notification-log-cleanup: unexpected schedule='$schedule'"
+    fail "CronJob notification-log-cleanup schedule must be */1 * * * *" "schedule=$schedule"
   fi
 
   if [[ "$WAIT_CRON" -eq 1 ]]; then
     echo "        Waiting up to 70s for the scheduler to fire at least one Job..."
-    local waited=0
+    local waited2=0
     local last_schedule=""
-    while [[ $waited -lt 70 ]]; do
-      last_schedule=$(kubectl -n "$LAB_NS" get cronjob notification-log-cleanup -o jsonpath='{.status.lastScheduleTime}' 2>/dev/null)
+    while [[ $waited2 -lt 70 ]]; do
+      last_schedule=$(kubectl -n "$REAL_NS" get cronjob notification-log-cleanup -o jsonpath='{.status.lastScheduleTime}' 2>/dev/null)
       [[ -n "$last_schedule" ]] && break
       sleep 5
-      waited=$((waited + 5))
+      waited2=$((waited2 + 5))
     done
     if [[ -n "$last_schedule" ]]; then
-      pass "CronJob notification-log-cleanup: status.lastScheduleTime=$last_schedule"
-      explain "A CronJob in '$LAB_NS' cleaned up real rows in '$REAL_NS' — the CronJob controller itself is fully namespace-agnostic about where its target Service lives."
+      pass "CronJob must fire at least one Job on schedule" "lastScheduleTime=$last_schedule"
+      explain "The CronJob controller created a fresh Job and ran the real DELETE against notification_log in $REAL_NS (scoped to rows older than 30 days)."
     else
-      skip "CronJob notification-log-cleanup: no lastScheduleTime after 70s"
-      explain "Timing issue, not necessarily a bug — cron ticks land on the wall-clock minute boundary."
+      skip "CronJob must fire at least one Job on schedule" "no lastScheduleTime after 70s"
+      explain "Timing issue, not necessarily a bug — cron ticks land on the wall-clock minute boundary. Re-run without --no-wait-cron or wait a bit."
     fi
   else
-    skip "CronJob trigger wait disabled (--no-wait-cron)"
+    skip "CronJob must fire at least one Job on schedule" "wait disabled (--no-wait-cron)"
   fi
+
+  # Cleanup - remove the test Jobs/CronJob from the real namespace so it's left as it was found
+  kubectl -n "$REAL_NS" delete job db-migrate db-connection-check-fail --ignore-not-found >/dev/null 2>&1
+  kubectl -n "$REAL_NS" delete cronjob notification-log-cleanup --ignore-not-found >/dev/null 2>&1
+  echo "        (Cleaned up db-migrate, db-connection-check-fail, and notification-log-cleanup from $REAL_NS.)"
 }
 
 # ---------------------------------------------------------------------------
-# Lab 1.4 — Label & Annotation Drill (real service images as scale-test Pods, in LAB_NS)
+# Lab 1.4 — Label & Annotation Drill, run as REAL standalone Pods directly in
+# REAL_NS (matching lesson1/1.4's own reference YAML exactly - short DNS names,
+# no lab namespace). These 5 Pods are separate from the real Deployments (no
+# app=user-service/etc. label), so labeling them can never affect the actual
+# running project. Cleaned up at the end so the namespace is left as found.
 # ---------------------------------------------------------------------------
 verify_1_4() {
-  section "Lab 1.4 — Label & Annotation Drill (scale-test Pods, in $LAB_NS)"
+  section "Lab 1.4 — Label & Annotation Drill (real standalone Pods, in $REAL_NS)"
 
   declare -A pod_image=(
     [user-service-extra-1]="weather-alert/user-service:latest|api|PORT=8001"
@@ -486,75 +481,80 @@ verify_1_4() {
     [notification-dispatcher-extra-1]="weather-alert/notification-dispatcher:latest|dispatch|PORT=8004"
   )
 
+  # Clean slate in case a previous run didn't finish cleanup
+  kubectl -n "$REAL_NS" delete pods "${!pod_image[@]}" --ignore-not-found >/dev/null 2>&1
+
   for name in "${!pod_image[@]}"; do
     IFS='|' read -r image tier portenv <<< "${pod_image[$name]}"
-    if ! kubectl -n "$LAB_NS" get pod "$name" >/dev/null 2>&1; then
-      kubectl -n "$LAB_NS" run "$name" \
-        --image="$image" --image-pull-policy=Never \
-        --labels="app=weather-alert-scale-demo,tier=$tier" \
-        --env="$portenv,DB_HOST=${POSTGRES_FQDN},DB_PORT=5432,DB_USER=weather_app,DB_PASSWORD=weather_app,DB_NAME=weather_alert,NATS_URL=nats://${NATS_FQDN}:4222,REDIS_URL=${REDIS_FQDN}:6379" >/dev/null
-    fi
+    kubectl -n "$REAL_NS" run "$name" \
+      --image="$image" --image-pull-policy=Never \
+      --labels="app=weather-alert-scale-demo,tier=$tier" \
+      --env="$portenv,DB_HOST=postgres,DB_PORT=5432,DB_USER=weather_app,DB_PASSWORD=weather_app,DB_NAME=weather_alert,NATS_URL=nats://nats:4222,REDIS_URL=redis:6379" >/dev/null
   done
   for name in "${!pod_image[@]}"; do
-    kubectl -n "$LAB_NS" wait --for=condition=Ready "pod/$name" --timeout=60s >/dev/null 2>&1
+    kubectl -n "$REAL_NS" wait --for=condition=Ready "pod/$name" --timeout=60s >/dev/null 2>&1
   done
 
   local api_count worker_count dispatch_count
-  api_count=$(kubectl -n "$LAB_NS" get pods -l app=weather-alert-scale-demo,tier=api --no-headers 2>/dev/null | wc -l)
-  worker_count=$(kubectl -n "$LAB_NS" get pods -l app=weather-alert-scale-demo,tier=worker --no-headers 2>/dev/null | wc -l)
-  dispatch_count=$(kubectl -n "$LAB_NS" get pods -l app=weather-alert-scale-demo,tier=dispatch --no-headers 2>/dev/null | wc -l)
+  api_count=$(kubectl -n "$REAL_NS" get pods -l app=weather-alert-scale-demo,tier=api --no-headers 2>/dev/null | wc -l)
+  worker_count=$(kubectl -n "$REAL_NS" get pods -l app=weather-alert-scale-demo,tier=worker --no-headers 2>/dev/null | wc -l)
+  dispatch_count=$(kubectl -n "$REAL_NS" get pods -l app=weather-alert-scale-demo,tier=dispatch --no-headers 2>/dev/null | wc -l)
 
   if [[ "$api_count" -eq 2 && "$worker_count" -eq 2 && "$dispatch_count" -eq 1 ]]; then
-    pass "Selectors return expected counts: tier=api->2, tier=worker->2, tier=dispatch->1"
-    explain "These are real service images running entirely in '$LAB_NS', reaching their dependencies in '$REAL_NS' by FQDN — labels/selectors themselves are always namespace-local."
+    pass "Selectors must return tier=api->2, tier=worker->2, tier=dispatch->1" "api=$api_count, worker=$worker_count, dispatch=$dispatch_count"
+    explain "These are the real service images, standalone Pods living in $REAL_NS alongside the actual Deployments — but with no app=user-service/etc. label, so they can never be matched by the real Services' selectors."
   else
-    fail "Selector counts wrong: api=$api_count worker=$worker_count dispatch=$dispatch_count"
+    fail "Selectors must return tier=api->2, tier=worker->2, tier=dispatch->1" "api=$api_count, worker=$worker_count, dispatch=$dispatch_count"
   fi
 
   # Overwrite test — mark one replica as a canary
-  kubectl -n "$LAB_NS" label pod user-service-extra-1 tier=canary --overwrite >/dev/null 2>&1
+  kubectl -n "$REAL_NS" label pod user-service-extra-1 tier=canary --overwrite >/dev/null 2>&1
   local canary_tier
-  canary_tier=$(kubectl -n "$LAB_NS" get pod user-service-extra-1 -o jsonpath='{.metadata.labels.tier}' 2>/dev/null)
+  canary_tier=$(kubectl -n "$REAL_NS" get pod user-service-extra-1 -o jsonpath='{.metadata.labels.tier}' 2>/dev/null)
   if [[ "$canary_tier" == "canary" ]]; then
-    pass "user-service-extra-1 relabeled tier=canary"
+    pass "user-service-extra-1 must be relabeled tier=canary" "tier=$canary_tier"
     explain "--overwrite was required since 'tier' already existed — this is exactly how you'd mark one replica for canary testing without touching the others."
   else
-    fail "user-service-extra-1 tier=$canary_tier (expected canary)"
+    fail "user-service-extra-1 must be relabeled tier=canary" "tier=$canary_tier"
   fi
 
   # Bulk update test
-  kubectl -n "$LAB_NS" label pods -l app=weather-alert-scale-demo env=scale-test --overwrite >/dev/null 2>&1
+  kubectl -n "$REAL_NS" label pods -l app=weather-alert-scale-demo env=scale-test --overwrite >/dev/null 2>&1
   local scale_test_count
-  scale_test_count=$(kubectl -n "$LAB_NS" get pods -l env=scale-test --no-headers 2>/dev/null | wc -l)
+  scale_test_count=$(kubectl -n "$REAL_NS" get pods -l app=weather-alert-scale-demo,env=scale-test --no-headers 2>/dev/null | wc -l)
   if [[ "$scale_test_count" -eq 5 ]]; then
-    pass "Bulk label update: all 5 scale-demo pods now have env=scale-test"
+    pass "Bulk label update must set env=scale-test on all 5 scale-demo Pods" "count=$scale_test_count"
   else
-    fail "Expected 5 pods with env=scale-test, got $scale_test_count"
+    fail "Bulk label update must set env=scale-test on all 5 scale-demo Pods" "count=$scale_test_count"
   fi
 
-  # Confirm the REAL project (different namespace entirely) was never touched
+  # Confirm the REAL Deployment-managed Pods (different label set) were never touched
   local real_pod_count
   real_pod_count=$(kubectl -n "$REAL_NS" get pods -l app=user-service,env=scale-test --no-headers 2>/dev/null | wc -l)
   if [[ "$real_pod_count" -eq 0 ]]; then
-    pass "Real user-service Deployment in '$REAL_NS' unaffected by scale-demo labeling"
-    explain "Because these lab Pods live in a completely separate namespace, there was never any chance of a selector in '$REAL_NS' matching them — stronger isolation than same-namespace naming alone."
+    pass "Real user-service Deployment Pods must be unaffected by scale-demo labeling" "matched=$real_pod_count"
+    explain "Even in the SAME namespace, the real Deployment's Pods carry only app=user-service (no tier/scale-demo label), so no selector used here could ever match them — label selectors are exact-match on the full key set, not proximity."
   else
-    fail "Unexpectedly found $real_pod_count real user-service pods with env=scale-test"
+    fail "Real user-service Deployment Pods must be unaffected by scale-demo labeling" "matched=$real_pod_count"
   fi
 
   # Annotation not selectable
-  kubectl -n "$LAB_NS" annotate pods -l app=weather-alert-scale-demo \
+  kubectl -n "$REAL_NS" annotate pods -l app=weather-alert-scale-demo \
     note="temporary scale-test pods, safe to delete" --overwrite >/dev/null 2>&1
   local annotated_note
-  annotated_note=$(kubectl -n "$LAB_NS" get pod alert-evaluator-extra-1 -o jsonpath='{.metadata.annotations.note}' 2>/dev/null)
+  annotated_note=$(kubectl -n "$REAL_NS" get pod alert-evaluator-extra-1 -o jsonpath='{.metadata.annotations.note}' 2>/dev/null)
   local selector_result
-  selector_result=$(kubectl -n "$LAB_NS" get pods -l note="temporary scale-test pods, safe to delete" --no-headers 2>/dev/null | wc -l)
+  selector_result=$(kubectl -n "$REAL_NS" get pods -l note="temporary scale-test pods, safe to delete" --no-headers 2>/dev/null | wc -l)
   if [[ -n "$annotated_note" && "$selector_result" -eq 0 ]]; then
-    pass "Annotation set (note='$annotated_note') but NOT selectable via -l"
+    pass "Annotation must be set but NOT selectable via -l" "note='$annotated_note', selector_matches=$selector_result"
     explain "Core Label vs Annotation distinction: annotations hold metadata, but only labels participate in selector queries."
   else
-    fail "Annotation check failed: note='$annotated_note' selector_result=$selector_result"
+    fail "Annotation must be set but NOT selectable via -l" "note='$annotated_note', selector_matches=$selector_result"
   fi
+
+  # Cleanup - remove the standalone test Pods so the namespace is left as it was found
+  kubectl -n "$REAL_NS" delete pods "${!pod_image[@]}" --ignore-not-found >/dev/null 2>&1
+  echo "        (Cleaned up the 5 scale-demo Pods from $REAL_NS.)"
 }
 
 # ---------------------------------------------------------------------------
@@ -625,10 +625,10 @@ verify_1_5() {
 preflight
 if [[ "$PREFLIGHT_OK" -eq 1 ]]; then
   verify_1_1
-  # TODO: re-enable once lab 1.1 checks are confirmed passing
-  # verify_1_2
-  # verify_1_3
-  # verify_1_4
+  verify_1_2
+  verify_1_3
+  verify_1_4
+  # TODO: re-enable once labs 1.1-1.4 checks are confirmed passing
   # verify_1_5
 else
   echo ""

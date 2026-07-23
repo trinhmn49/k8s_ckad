@@ -13,6 +13,61 @@ spec:
       labels:
         app: notification-dispatcher
     spec:
+      # Shared between the init container and the main container - this is how
+      # the init container hands proof of its work to the app, since they're
+      # otherwise fully isolated (separate filesystems).
+      volumes:
+        - name: config-check-vol
+          emptyDir: {}
+      # INIT CONTAINER: fails fast if a required secret is missing/empty, instead
+      # of letting the main container start and misbehave (or crash later) with
+      # incomplete config. Also stages a status file into the shared emptyDir
+      # volume, proving to the main container that the check actually ran.
+      # See lesson1/1.2 for the write-up of this pattern.
+      initContainers:
+        - name: check-config
+          image: postgres:15-alpine
+          env:
+            - name: DB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: app-secrets
+                  key: DB_USER
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: app-secrets
+                  key: DB_PASSWORD
+            - name: APNS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: app-secrets
+                  key: APNS_KEY_ID
+            - name: APNS_TEAM_ID
+              valueFrom:
+                secretKeyRef:
+                  name: app-secrets
+                  key: APNS_TEAM_ID
+          command:
+            - /bin/sh
+            - -c
+            - |
+              missing=""
+              for var in DB_USER DB_PASSWORD APNS_KEY_ID APNS_TEAM_ID; do
+                eval val=\$$var
+                if [ -z "$val" ]; then
+                  missing="$missing $var"
+                fi
+              done
+              if [ -n "$missing" ]; then
+                echo "Missing required config:$missing"
+                exit 1
+              fi
+              echo "Config check passed: DB_USER, DB_PASSWORD, APNS_KEY_ID, APNS_TEAM_ID all set"
+              echo "config-check-passed $(date -u +%Y-%m-%dT%H:%M:%SZ)" > /status/config-check
+          volumeMounts:
+            - name: config-check-vol
+              mountPath: /status
       containers:
         - name: notification-dispatcher
           image: weather-alert/notification-dispatcher:latest
@@ -55,6 +110,10 @@ spec:
           envFrom:
             - configMapRef:
                 name: app-config
+          volumeMounts:
+            - name: config-check-vol
+              mountPath: /status
+              readOnly: true
           readinessProbe:
             httpGet:
               path: /health
@@ -74,6 +133,30 @@ spec:
             limits:
               cpu: 250m
               memory: 128Mi
+        # SIDECAR CONTAINER: polls the app's own /health endpoint over localhost
+        # and logs the result — the same visibility pattern a log-shipper/monitoring
+        # sidecar would use in production.
+        - name: health-monitor
+          image: postgres:15-alpine
+          command:
+            - /bin/sh
+            - -c
+            - |
+              while true; do
+                if wget -qO- http://localhost:8004/health; then
+                  echo "$(date): dispatcher healthy"
+                else
+                  echo "$(date): dispatcher NOT reachable yet"
+                fi
+                sleep 10
+              done
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
 ---
 apiVersion: v1
 kind: Service

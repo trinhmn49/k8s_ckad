@@ -1,0 +1,219 @@
+# Lab 3.4 — Namespace Quotas
+# Duration: ~45 min | CKAD domain: Application Environment, Configuration & Security (25%)
+# Apply a ResourceQuota and a LimitRange
+# Observe a Pod get rejected when it would exceed quota
+# Applied directly to the REAL weather-alert namespace, alongside the actual
+# running project
+
+# ============================================================================
+# PREREQUISITE
+# ============================================================================
+# Requires the weather-alert namespace + full stack already deployed and
+# Running (see weather-alert/README.md "Deploy to Minikube").
+#
+# SAFETY NOTE: ResourceQuota/LimitRange only affect NEW object admission -
+# they NEVER retroactively evict or restart Pods that already exist. The
+# quota numbers below are set generously above what the real project
+# actually uses, so nothing already running is ever at risk, even if a real
+# Deployment's Pod happens to get rescheduled while this lab is active.
+
+# ============================================================================
+# DETAILED EXPLANATION
+# ============================================================================
+#
+# RESOURCEQUOTA vs LIMITRANGE - DIFFERENT JOBS
+#    - ResourceQuota: a NAMESPACE-WIDE budget cap (total pods, total
+#      requests.cpu/memory, total limits.cpu/memory across EVERY object)
+#    - LimitRange: PER-CONTAINER rules (default request/limit if a Pod spec
+#      omits them, plus min/max bounds a container's own values must fall
+#      within)
+#    - You typically want BOTH: LimitRange keeps individual containers
+#      sane, ResourceQuota keeps the namespace's total footprint sane
+#
+# ADMISSION-TIME ONLY - NOT RETROACTIVE
+#    - Both are enforced ONLY when an object is CREATED (or a Pod spec is
+#      otherwise submitted) - they never touch objects that already exist
+#    - This is why applying a strict quota to a namespace with running
+#      Pods is safe: nothing gets killed, but the NEXT Pod creation that
+#      would violate the budget gets rejected outright by the API server
+#
+# WHY EVERY CONTAINER NEEDS resources.requests SET
+#    - A ResourceQuota with requests.cpu/requests.memory in its hard limits
+#      REQUIRES every new Pod's containers to specify those requests
+#      explicitly, UNLESS a LimitRange provides a default - this is exactly
+#      why weather-alert's own Deployments all set resources.requests
+#      (see lesson1/1.1)
+#
+# ============================================================================
+
+# ============================================================================
+# STEP 1: Apply a namespace-wide ResourceQuota (generous - see SAFETY NOTE)
+# ============================================================================
+
+kubectl -n weather-alert apply -f - <<'EOF'
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: weather-alert-quota
+  namespace: weather-alert
+spec:
+  hard:
+    pods: "50"
+    requests.cpu: "4"
+    requests.memory: 4Gi
+    limits.cpu: "8"
+    limits.memory: 8Gi
+EOF
+
+kubectl -n weather-alert describe resourcequota weather-alert-quota
+# "Used" column shows the REAL current usage across every already-running
+# Pod in the namespace - confirm it's comfortably under "Hard"
+
+# ============================================================================
+# STEP 2: Apply a LimitRange (per-container defaults + bounds)
+# ============================================================================
+
+kubectl -n weather-alert apply -f - <<'EOF'
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: weather-alert-limits
+  namespace: weather-alert
+spec:
+  limits:
+  - type: Container
+    default: {cpu: 200m, memory: 128Mi}
+    defaultRequest: {cpu: 50m, memory: 64Mi}
+    min: {cpu: 10m, memory: 16Mi}
+    max: {cpu: "1", memory: 1Gi}
+EOF
+
+kubectl -n weather-alert describe limitrange weather-alert-limits
+
+# ============================================================================
+# STEP 3: Observe a Pod get REJECTED for exceeding the quota
+# ============================================================================
+
+# Deliberately ask for far more than the LimitRange max (1 core) AND the
+# ResourceQuota's total headroom - the API server rejects this at admission
+# time, before any Pod object is even created:
+kubectl -n weather-alert apply -f - <<'EOF'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: quota-test-toobig
+  namespace: weather-alert
+spec:
+  containers:
+  - name: oversized
+    image: postgres:15-alpine
+    command: ["sleep", "3600"]
+    resources:
+      requests: {cpu: "10", memory: 8Gi}
+      limits: {cpu: "10", memory: 8Gi}
+EOF
+# Expect: error from server (Forbidden): ... exceeds ... (LimitRange max
+# and/or ResourceQuota) - the apply command itself fails, nothing is created
+
+kubectl -n weather-alert get pod quota-test-toobig
+# Expect: Error from server (NotFound) - it was never admitted
+
+# ============================================================================
+# STEP 4: A normal Pod (within bounds) still succeeds, and picks up
+# LimitRange defaults automatically
+# ============================================================================
+
+kubectl -n weather-alert apply -f - <<'EOF'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: quota-test-ok
+  namespace: weather-alert
+spec:
+  containers:
+  - name: fits
+    image: postgres:15-alpine
+    command: ["sleep", "3600"]
+    # No resources block at all - LimitRange should inject the defaults
+EOF
+
+kubectl -n weather-alert wait --for=condition=Ready pod/quota-test-ok --timeout=30s
+
+# Confirm the LimitRange's defaults were auto-injected, even though this
+# Pod spec never mentioned resources at all:
+kubectl -n weather-alert get pod quota-test-ok -o jsonpath='{.spec.containers[0].resources}'
+echo ""
+# Expect: requests cpu:50m/memory:64Mi, limits cpu:200m/memory:128Mi
+
+# ============================================================================
+# STEP 5: Verification commands
+# ============================================================================
+
+kubectl -n weather-alert describe resourcequota weather-alert-quota
+# "Used" should now include quota-test-ok's defaulted request, but stay far
+# under "Hard"
+
+# Confirm the REAL Deployments are all still Ready - nothing was disrupted:
+kubectl -n weather-alert get deployments
+
+# ============================================================================
+# CLEANUP
+# ============================================================================
+kubectl -n weather-alert delete pod quota-test-ok quota-test-toobig --ignore-not-found
+kubectl -n weather-alert delete resourcequota weather-alert-quota --ignore-not-found
+kubectl -n weather-alert delete limitrange weather-alert-limits --ignore-not-found
+
+# ============================================================================
+# KEY CONCEPTS FOR CKAD EXAM
+# ============================================================================
+#
+# 1. ResourceQuota FIELDS:
+#    - pods                          -> max total Pod count
+#    - requests.cpu / requests.memory -> sum of every container's requests
+#    - limits.cpu / limits.memory     -> sum of every container's limits
+#
+# 2. LimitRange FIELDS (per type: Container/Pod/PersistentVolumeClaim):
+#    - default / defaultRequest -> auto-injected if the Pod spec omits them
+#    - min / max                -> hard bounds a container's own values must
+#      respect, whether set explicitly or defaulted
+#
+# 3. ADMISSION-TIME ENFORCEMENT ONLY:
+#    - Both objects can be added to a namespace that's already full of
+#      running Pods with zero disruption to those Pods
+#    - The next Pod creation that would violate either gets a hard REJECT
+#      from the API server, not a warning
+#
+# 4. ResourceQuota WITH requests SET FORCES EXPLICIT (OR DEFAULTED) REQUESTS:
+#    - Once a ResourceQuota constrains requests.cpu/memory, EVERY new Pod's
+#      containers must have those set (by the Pod spec itself, or by a
+#      LimitRange default) or the Pod is rejected outright
+#
+# ============================================================================
+# TROUBLESHOOTING
+# ============================================================================
+#
+# If quota-test-toobig somehow gets created instead of rejected:
+# - Confirm the ResourceQuota/LimitRange actually applied successfully:
+#   kubectl -n weather-alert get resourcequota,limitrange
+# - Confirm you're applying into the SAME namespace the quota targets
+#
+# If quota-test-ok fails to get scheduled (Pending, not Ready):
+# - Check if the CLUSTER (not just the namespace quota) has enough real
+#   CPU/memory capacity: kubectl describe node
+#
+# If `kubectl apply` for the oversized Pod doesn't show an obvious quota
+# error message:
+# - Run it without -f - (heredoc) once via `kubectl apply -f
+#   quota-test-toobig.yaml` and read the full stderr - the reason names the
+#   specific quota or LimitRange field that was violated
+#
+# ============================================================================
+# EXAM TIPS:
+# - `kubectl describe resourcequota <name>` is the fastest way to see
+#   Used/Hard side by side - faster than computing it yourself
+# - A Pod that fails to even get created (not Pending, not CrashLoopBackOff -
+#   just never appears) is the signature of a quota/LimitRange rejection,
+#   different from a scheduling or runtime failure
+# - LimitRange defaults only apply to containers that OMIT the field
+#   entirely - partially specifying resources (e.g. only limits, no
+#   requests) still gets a default injected for the missing piece

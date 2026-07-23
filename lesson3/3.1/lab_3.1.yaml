@@ -1,0 +1,207 @@
+# Lab 3.1 — ConfigMap & Secret Injection
+# Duration: ~45 min | CKAD domain: Application Environment, Configuration & Security (25%)
+# Create a Secret from a file and a ConfigMap from literal values
+# Inject the Secret as an env var and the ConfigMap as a mounted volume, in
+# ONE Pod
+# Uses the real weather-alert/user-service image - not a generic
+# nginx/busybox placeholder
+#
+# NOTE: lesson1/1.5 already covered envFrom(ConfigMap)/secretKeyRef(env) on
+# the REAL app-config/app-secrets objects. This lab deliberately covers the
+# OTHER two creation/injection mechanisms - --from-file for Secrets and a
+# mounted ConfigMap volume - so both major patterns are exercised somewhere.
+
+# ============================================================================
+# PREREQUISITE
+# ============================================================================
+# Requires the weather-alert namespace + user-service image already built
+# into minikube's Docker daemon (see weather-alert/README.md "Deploy to
+# Minikube"). This lab's own Secret/ConfigMap/Pod are all standalone -
+# nothing here touches the real app-config/app-secrets objects.
+
+# ============================================================================
+# DETAILED EXPLANATION
+# ============================================================================
+#
+# FOUR WAYS TO POPULATE A CONFIGMAP/SECRET (know all of them):
+#    --from-literal=KEY=value       -> one key/value pair per flag
+#    --from-file=KEY=path/to/file   -> file CONTENTS become the value of KEY
+#    --from-file=path/to/dir/       -> every file in the dir becomes a key
+#    --from-env-file=path.env       -> bulk-load KEY=value lines from a file
+#
+# TWO WAYS TO CONSUME THEM IN A POD (know both):
+#    1. ENV VAR - one key becomes one environment variable
+#         valueFrom.secretKeyRef / valueFrom.configMapKeyRef
+#       - Snapshotted at container start; editing the object later does NOT
+#         update an already-running container (see lesson1/1.5)
+#    2. VOLUME MOUNT - every key becomes a FILE inside the mounted directory
+#         volumes[].secret / volumes[].configMap
+#       - A mounted ConfigMap/Secret volume DOES auto-update the files
+#         inside a running container (kubelet syncs periodically, no
+#         restart needed) - the opposite tradeoff of env var injection
+#
+# WHY THIS MATTERS ON THE EXAM:
+#    - "Inject as env var" and "inject as volume" are different YAML shapes
+#      under the same Pod - this lab does BOTH in one Pod so the contrast is
+#      visible side by side
+#
+# ============================================================================
+
+# ============================================================================
+# STEP 1: Create a Secret FROM A FILE
+# ============================================================================
+# Simulates fetching a real credential file (an APNs signing key, same
+# concept as lesson1/1.2) and storing its contents as a Secret:
+
+echo "LAB-3.1-DEMO-APNS-KEY-CONTENT" > /tmp/apns-key.p8
+kubectl -n weather-alert create secret generic demo-apns-secret \
+  --from-file=apns-key.p8=/tmp/apns-key.p8
+rm /tmp/apns-key.p8
+
+# Confirm it's base64-encoded storage, not literal plaintext in the object:
+kubectl -n weather-alert get secret demo-apns-secret -o jsonpath='{.data.apns-key\.p8}'
+echo ""
+kubectl -n weather-alert get secret demo-apns-secret -o jsonpath='{.data.apns-key\.p8}' | base64 -d
+echo ""
+
+# ============================================================================
+# STEP 2: Create a ConfigMap FROM LITERAL values
+# ============================================================================
+
+kubectl -n weather-alert create configmap demo-app-config \
+  --from-literal=LOG_LEVEL=debug \
+  --from-literal=FEATURE_FLAG=new-ui-enabled
+
+kubectl -n weather-alert get configmap demo-app-config -o jsonpath='{.data}'
+echo ""
+
+# ============================================================================
+# STEP 3: ONE Pod - Secret as env var, ConfigMap as a mounted volume
+# ============================================================================
+
+kubectl -n weather-alert apply -f - <<'EOF'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: config-secret-demo
+  namespace: weather-alert
+  labels:
+    app: config-secret-demo
+spec:
+  containers:
+  - name: user-service
+    image: weather-alert/user-service:latest
+    imagePullPolicy: Never
+    env:
+    - name: PORT
+      value: "8001"
+    # Required so the real binary can actually reach Postgres and start -
+    # without these it Fatal()s on dbPool.Ping() before serving anything
+    - name: DB_USER
+      valueFrom:
+        secretKeyRef: {name: app-secrets, key: DB_USER}
+    - name: DB_PASSWORD
+      valueFrom:
+        secretKeyRef: {name: app-secrets, key: DB_PASSWORD}
+    # SECRET AS ENV VAR - one key becomes one variable
+    - name: APNS_KEY_CONTENT
+      valueFrom:
+        secretKeyRef:
+          name: demo-apns-secret
+          key: apns-key.p8
+    envFrom:
+    - configMapRef: {name: app-config}   # DB_HOST/DB_PORT/DB_NAME/NATS_URL/LOG_LEVEL
+    volumeMounts:
+    # CONFIGMAP AS VOLUME - every key becomes a file under this path
+    - name: config-vol
+      mountPath: /etc/demo-config
+      readOnly: true
+    resources:
+      requests: {cpu: 50m, memory: 64Mi}
+      limits: {cpu: 250m, memory: 128Mi}
+  volumes:
+  - name: config-vol
+    configMap:
+      name: demo-app-config
+EOF
+
+kubectl -n weather-alert wait --for=condition=Ready pod/config-secret-demo --timeout=60s
+
+# ============================================================================
+# STEP 4: Verification commands
+# ============================================================================
+
+# Secret injected as env var:
+kubectl -n weather-alert exec config-secret-demo -- printenv APNS_KEY_CONTENT
+# Expect: LAB-3.1-DEMO-APNS-KEY-CONTENT
+
+# ConfigMap injected as mounted files (one file per key):
+kubectl -n weather-alert exec config-secret-demo -- ls /etc/demo-config
+kubectl -n weather-alert exec config-secret-demo -- cat /etc/demo-config/LOG_LEVEL
+echo ""
+kubectl -n weather-alert exec config-secret-demo -- cat /etc/demo-config/FEATURE_FLAG
+echo ""
+# Expect: debug / new-ui-enabled
+
+# Prove a mounted ConfigMap volume updates WITHOUT a Pod restart (env vars can't do this):
+kubectl -n weather-alert patch configmap demo-app-config --type merge -p '{"data":{"LOG_LEVEL":"trace"}}'
+sleep 150  # kubelet's ConfigMap cache TTL + sync period can add up to ~2 minutes
+kubectl -n weather-alert exec config-secret-demo -- cat /etc/demo-config/LOG_LEVEL
+echo ""
+# Expect: trace - the SAME Pod, never restarted, picked up the new value
+
+# ============================================================================
+# CLEANUP
+# ============================================================================
+kubectl -n weather-alert delete pod config-secret-demo --ignore-not-found
+kubectl -n weather-alert delete configmap demo-app-config --ignore-not-found
+kubectl -n weather-alert delete secret demo-apns-secret --ignore-not-found
+
+# ============================================================================
+# KEY CONCEPTS FOR CKAD EXAM
+# ============================================================================
+#
+# 1. CREATION FLAGS:
+#    --from-literal=K=V   --from-file=K=path   --from-file=dir/   --from-env-file=file
+#
+# 2. INJECTION SHAPES:
+#    - env var:  valueFrom.secretKeyRef / valueFrom.configMapKeyRef (single key)
+#    - envFrom:  configMapRef / secretRef (ALL keys become env vars at once)
+#    - volume:   volumes[].secret / volumes[].configMap (ALL keys become files)
+#
+# 3. UPDATE BEHAVIOR IS THE #1 EXAM GOTCHA:
+#    - env var (either form) -> snapshotted at container start, needs a
+#      Pod restart/rollout to pick up a change
+#    - volume mount -> kubelet re-syncs the files periodically (~1 min),
+#      NO restart needed - but the app itself must re-read the file to
+#      notice (Kubernetes doesn't tell your process the file changed)
+#
+# 4. SECRETS ARE ENCODED, NOT ENCRYPTED AT REST BY DEFAULT:
+#    - `kubectl get secret ... -o jsonpath='{.data.KEY}' | base64 -d` proves
+#      this instantly - same lesson as lesson1/1.5, worth re-confirming here
+#
+# ============================================================================
+# TROUBLESHOOTING
+# ============================================================================
+#
+# If the mounted ConfigMap directory is empty:
+# - Confirm the Pod's volumes[].configMap.name matches an EXISTING ConfigMap
+#   in the SAME namespace - a typo here fails silently (empty mount, no error)
+#
+# If printenv shows nothing for a secretKeyRef:
+# - Confirm the Secret key name matches exactly (`apns-key.p8`, including
+#   the dot) - jsonpath needs `{.data.apns-key\.p8}` (escaped dot) to look it up
+#
+# If the patched ConfigMap value doesn't show up after ~2 minutes:
+# - Confirm you're reading the FILE inside the container again (cat), not a
+#   cached shell variable - env vars from a volume-mounted file are never
+#   auto re-exported, only the file content updates
+#
+# ============================================================================
+# EXAM TIPS:
+# - `--from-file=KEY=path` lets you rename the key - `--from-file=path` alone
+#   uses the file's own basename as the key
+# - A mounted Secret/ConfigMap directory REPLACES anything else at that
+#   mountPath - don't mountPath onto a directory your app also writes to
+# - Volume-mounted config auto-updates; env-var config does not - pick
+#   whichever matches whether your app can hot-reload a file

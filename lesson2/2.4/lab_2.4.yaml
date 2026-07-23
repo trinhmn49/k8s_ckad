@@ -1,0 +1,182 @@
+# Lab 2.4 — Kustomize Overlay
+# Duration: ~45 min | CKAD domain: Application Deployment (20%)
+# Structure base and overlay directories
+# Patch image tag and replica count without duplicating manifests
+# Uses the real weather-alert/user-service image, packaged as a standalone
+# Kustomize base+overlays under this lab's own kustomize/ directory - not a
+# generic nginx/busybox placeholder
+#
+# This lab's Deployment/Service (user-service-demo) are separate from the
+# real user-service Deployment/Service - nothing here touches the actual
+# running project.
+
+# ============================================================================
+# PREREQUISITE
+# ============================================================================
+# Requires the weather-alert namespace + backing services + configmap/secret
+# already deployed, and the user-service image already built into minikube's
+# Docker daemon:
+#   kubectl apply -f ../../weather-alert/k8s/namespace.yaml
+#   kubectl apply -f ../../weather-alert/k8s/configmaps/
+#   kubectl apply -f ../../weather-alert/k8s/secrets/
+#   kubectl apply -f ../../weather-alert/k8s/backing-services/
+# Verify: kubectl -n weather-alert get pods -l app=postgres
+#
+# The "v2" image tag used by the prod overlay must exist locally (same trick
+# as lab 2.1 - same real binary, just a second tag). From WSL, with
+# `eval $(minikube docker-env)` active:
+#   docker tag weather-alert/user-service:latest weather-alert/user-service:v2
+
+# ============================================================================
+# DETAILED EXPLANATION
+# ============================================================================
+#
+# WHY KUSTOMIZE (vs copy-pasting YAML per environment)
+#    - Without Kustomize: a "prod" folder duplicates the ENTIRE Deployment
+#      YAML from "dev", just to change replicas/image - two full copies that
+#      drift out of sync over time
+#    - With Kustomize: ONE base manifest + small overlay PATCHES per
+#      environment - the base is the single source of truth
+#
+# DIRECTORY LAYOUT (see kustomize/ next to this file):
+#    kustomize/
+#      base/
+#        kustomization.yaml   -> lists the raw resources
+#        deployment.yaml      -> full Deployment spec (env-agnostic defaults)
+#        service.yaml         -> full Service spec
+#      overlays/
+#        dev/kustomization.yaml   -> patches base: replicas=1, tag=latest
+#        prod/kustomization.yaml  -> patches base: replicas=4, tag=v2
+#
+#    Every overlay's kustomization.yaml starts with `resources: [../../base]`
+#    - it does NOT copy deployment.yaml/service.yaml, it references the base
+#    and layers small transformers on top:
+#      - `replicas:`      -> patches .spec.replicas by resource name
+#      - `images:`        -> patches the image tag by image name
+#      - `commonLabels:`  -> adds a label (env: dev/prod) to every resource,
+#                            including Selectors, keeping Deployment/Service
+#                            selectors in sync automatically
+#
+# BUILD vs APPLY:
+#    - `kubectl kustomize <dir>`  -> renders the FINAL merged YAML, no cluster
+#      contact - use this to preview/diff before applying (exam speed habit)
+#    - `kubectl apply -k <dir>`   -> renders AND applies in one step
+#
+# IMPORTANT GOTCHA THIS LAB DEMONSTRATES:
+#    - Both overlays target the SAME resource name (user-service-demo) in the
+#      SAME namespace. Applying dev then prod WITHOUT deleting dev first will
+#      FAIL - commonLabels changes .spec.selector.matchLabels, and that field
+#      is immutable after creation. This is realistic: overlays for the SAME
+#      environment slot are meant to REPLACE each other, not coexist. Delete
+#      one overlay before applying the other (see Steps 2-3 below).
+#
+# ============================================================================
+
+# ============================================================================
+# STEP 1: Preview each overlay's fully-merged manifest (no cluster contact)
+# ============================================================================
+
+kubectl kustomize kustomize/overlays/dev
+kubectl kustomize kustomize/overlays/prod
+
+# Confirm the two previews actually differ where expected:
+diff <(kubectl kustomize kustomize/overlays/dev) <(kubectl kustomize kustomize/overlays/prod)
+# Expect diffs on: replicas (1 vs 4), image tag (latest vs v2), env label (dev vs prod)
+
+# ============================================================================
+# STEP 2: Apply the DEV overlay
+# ============================================================================
+
+kubectl apply -k kustomize/overlays/dev
+
+kubectl -n weather-alert rollout status deployment/user-service-demo
+
+kubectl -n weather-alert get deployment user-service-demo \
+  -o jsonpath='{.spec.replicas} {.spec.template.spec.containers[0].image} {.spec.template.metadata.labels.env}{"\n"}'
+# Expect: 1 weather-alert/user-service:latest dev
+
+# ============================================================================
+# STEP 3: Switch to the PROD overlay (delete dev's release first - see gotcha above)
+# ============================================================================
+
+kubectl delete -k kustomize/overlays/dev
+kubectl apply -k kustomize/overlays/prod
+
+kubectl -n weather-alert rollout status deployment/user-service-demo
+
+kubectl -n weather-alert get deployment user-service-demo \
+  -o jsonpath='{.spec.replicas} {.spec.template.spec.containers[0].image} {.spec.template.metadata.labels.env}{"\n"}'
+# Expect: 4 weather-alert/user-service:v2 prod
+
+# ============================================================================
+# STEP 4: Verification commands
+# ============================================================================
+
+# Confirm the base manifests were NEVER edited directly (single source of truth):
+git diff --stat kustomize/base/ 2>/dev/null || echo "(not a git repo here - confirm manually: base/ files are untouched)"
+
+# Confirm Pod count matches the active overlay:
+kubectl -n weather-alert get pods -l app=user-service-demo --no-headers | wc -l
+
+# Confirm the REAL user-service Deployment/Service were never touched:
+kubectl -n weather-alert get deployment user-service -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'
+kubectl -n weather-alert get pods -l app=user-service --no-headers | wc -l
+
+# ============================================================================
+# CLEANUP
+# ============================================================================
+kubectl delete -k kustomize/overlays/prod --ignore-not-found
+kubectl delete -k kustomize/overlays/dev --ignore-not-found
+
+# ============================================================================
+# KEY CONCEPTS FOR CKAD EXAM
+# ============================================================================
+#
+# 1. BASE + OVERLAY STRUCTURE:
+#    - base/          -> the raw, environment-agnostic manifests
+#    - overlays/<env>/ -> kustomization.yaml referencing the base + patches
+#
+# 2. COMMON KUSTOMIZE TRANSFORMERS:
+#    - replicas:      -> patch replica count by resource name
+#    - images:        -> patch image name/tag/digest by image name
+#    - commonLabels:  -> add labels everywhere, including selectors
+#    - namePrefix / nameSuffix -> rename resources per overlay (avoids
+#      naming collisions if you need dev/prod to coexist - not used here on
+#      purpose, to teach the immutable-selector gotcha directly)
+#    - patchesStrategicMerge / patches -> arbitrary field-level overrides
+#      when the built-in transformers above aren't enough
+#
+# 3. `kubectl kustomize` vs `kubectl apply -k`:
+#    - kustomize   -> render only, zero cluster risk, use to preview/diff
+#    - apply -k    -> render + apply in one command
+#
+# 4. NO SEPARATE KUSTOMIZE BINARY NEEDED:
+#    - kubectl has built it in since 1.14 (`-k` flag) - no extra install
+#
+# ============================================================================
+# TROUBLESHOOTING
+# ============================================================================
+#
+# If `kubectl apply -k overlays/prod` errors with something like
+# "field is immutable" on selector:
+# - You applied prod on top of dev without deleting dev first - see the
+#   gotcha in DETAILED EXPLANATION above. Run `kubectl delete -k
+#   kustomize/overlays/dev` first.
+#
+# If the rendered YAML doesn't show your expected replica count/image tag:
+# - Confirm you're pointed at the OVERLAY directory, not the base:
+#   kubectl kustomize kustomize/base   (shows unpatched defaults only)
+#
+# If `kubectl apply -k` can't find the base:
+# - `resources: [../../base]` is relative to the overlay's OWN
+#   kustomization.yaml location, not your current shell directory
+#
+# ============================================================================
+# EXAM TIPS:
+# - `kubectl kustomize <dir>` to preview before `apply -k` - same exam-speed
+#   habit as `--dry-run=client -o yaml` for imperative commands
+# - Know the 3 most common transformers cold: replicas, images, commonLabels
+# - `-k` takes a DIRECTORY path (containing kustomization.yaml), never a
+#   single file - a common mix-up with plain `-f`
+# - Deleting/re-applying (not patching in place) is often the safe path when
+#   an overlay change touches immutable fields like selectors

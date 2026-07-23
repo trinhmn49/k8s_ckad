@@ -1,208 +1,275 @@
-# Lab 2.2 — Services & DNS-Based Service Discovery
-# Duration: ~45 min | CKAD domain: Services and Networking (20%)
-# Understand how weather-alert's 4 microservices find "postgres", "redis", "nats"
-# by name alone, with no IP addresses hardcoded anywhere
-# Reproduce and diagnose a real "backend unreachable" incident on purpose
-# Learn the DNS -> Endpoints -> app-logs troubleshooting order
+# Lab 2.2 — Blue/Green Switch
+# Duration: ~45 min | CKAD domain: Application Deployment (20%)
+# Run two Deployments (blue and green)
+# Route traffic via a single Service selector flip
+# Uses the real weather-alert/user-service image, tagged as two color
+# variants - not a generic nginx/busybox placeholder
+#
+# This lab creates its OWN standalone Deployments/Service, completely
+# separate from the real user-service Deployment/Service - nothing here
+# touches the actual running project.
 
 # ============================================================================
 # PREREQUISITE
 # ============================================================================
-# Full weather-alert stack deployed and healthy in the "weather-alert" namespace:
-#   kubectl -n weather-alert get pods
-# All Pods should be Running. This lab is based on a real incident from building
-# this project: alert-evaluator logged "nats: no servers available for connection"
-# because its Pod started before the nats Service had a Ready backend.
+# Requires the weather-alert namespace + backing services already deployed,
+# and the user-service image already built into minikube's Docker daemon:
+#   kubectl apply -f ../../weather-alert/k8s/namespace.yaml
+#   kubectl apply -f ../../weather-alert/k8s/configmaps/
+#   kubectl apply -f ../../weather-alert/k8s/secrets/
+#   kubectl apply -f ../../weather-alert/k8s/backing-services/
+# Verify: kubectl -n weather-alert get pods -l app=postgres
 
 # ============================================================================
 # DETAILED EXPLANATION
 # ============================================================================
 #
-# WHY SERVICE NAMES WORK AS HOSTNAMES
+# BLUE/GREEN vs ROLLING UPDATE
+#    - Rolling update (lab 2.1): ONE Deployment, old and new Pods coexist
+#      briefly while traffic gradually shifts - gradual, same Service the
+#      whole time
+#    - Blue/Green: TWO separate Deployments running full-strength at once
+#      (blue = current, green = candidate). Traffic cuts over INSTANTLY by
+#      changing which Pods the Service selects - not gradual
+#    - Rollback is instant too: flip the selector back, no rollout needed
 #
-#    Every ClusterIP Service gets a DNS record via CoreDNS/kube-dns:
-#        <service-name>.<namespace>.svc.cluster.local
-#    From a Pod in the SAME namespace, the short name alone resolves:
-#        nats            -> nats.weather-alert.svc.cluster.local
-#    From a Pod in a DIFFERENT namespace, you need at least:
-#        nats.weather-alert
+# HOW THE CUTOVER ACTUALLY WORKS
+#    - A Service's .spec.selector is just a label query - it doesn't care
+#      which Deployment "owns" the Pods it matches
+#    - Both blue and green Pods carry a SHARED label (app=user-service-
+#      bluegreen) plus a DISTINGUISHING label (color=blue / color=green)
+#    - The Service starts selecting {app=user-service-bluegreen, color=blue}
+#    - Flipping color=blue -> color=green in the Service's selector re-
+#      populates Endpoints immediately - no Pods are created, deleted, or
+#      restarted by the flip itself
 #
-#    This is exactly why weather-alert's ConfigMap (app-config) can set:
-#        NATS_URL: "nats://nats:4222"
-#        DB_HOST:  "postgres"
-#        REDIS_URL: "redis:6379"
-#    with no IPs anywhere - Kubernetes DNS resolves the Service name to its
-#    stable ClusterIP, which load-balances across whatever Pods are Ready.
-#
-# SERVICE -> ENDPOINTS -> POD CHAIN
-#
-#    Service (stable name + ClusterIP - this never changes)
-#        |
-#        v  populated from
-#    Endpoints / EndpointSlice (list of Ready Pod IPs behind the Service)
-#        |
-#        v  backed by
-#    Pod (actual IP, changes every time the Pod is recreated)
-#
-#    - A Service with NO Ready backend Pods has an EMPTY Endpoints object
-#    - DNS resolution still SUCCEEDS (the Service name/IP exists) even with
-#      zero Endpoints - the connection just fails or hangs, which is exactly
-#      the "no servers available for connection" symptom from the real incident
-#    - This is the #1 exam/production gotcha: DNS working ≠ backend reachable
+# TRADE-OFF vs ROLLING UPDATE:
+#    - Blue/Green needs 2x the resources while both stacks are up
+#    - But rollback is instant (selector flip) vs rolling back through
+#      readiness-gated Pod churn
 #
 # ============================================================================
 
 # ============================================================================
-# STEP 1: Inspect existing Services and their DNS names
+# STEP 1: Tag the real image as two color variants
 # ============================================================================
+# Same real binary, two tags - enough to prove the cutover mechanics.
+# From WSL, with `eval $(minikube docker-env)` active:
 
-kubectl -n weather-alert get svc
-
-# Full DNS name pattern for any Service:
-kubectl -n weather-alert get svc nats -o jsonpath='{.metadata.name}.{.metadata.namespace}.svc.cluster.local{"\n"}'
-
-# ============================================================================
-# STEP 2: Verify DNS resolution from inside the cluster
-# ============================================================================
-
-# Launch a throwaway debug Pod in the SAME namespace:
-kubectl -n weather-alert run dns-test --rm -it --restart=Never --image=busybox:musl -- \
-  nslookup nats
-
-# Short name resolves because the debug Pod is in the same namespace.
-# Try the fully-qualified form too (works from ANY namespace):
-kubectl -n weather-alert run dns-test2 --rm -it --restart=Never --image=busybox:musl -- \
-  nslookup nats.weather-alert.svc.cluster.local
+docker tag weather-alert/user-service:latest weather-alert/user-service:blue
+docker tag weather-alert/user-service:latest weather-alert/user-service:green
 
 # ============================================================================
-# STEP 3: Verify actual TCP reachability (DNS success ≠ port open)
+# STEP 2: Deploy BOTH color variants at once
 # ============================================================================
 
-kubectl -n weather-alert run net-test --rm -it --restart=Never --image=busybox:musl -- \
-  sh -c "nc -zv nats 4222 && nc -zv postgres 5432 && nc -zv redis 6379"
+kubectl -n weather-alert apply -f - <<'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: user-service-blue
+  namespace: weather-alert
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: user-service-bluegreen
+      color: blue
+  template:
+    metadata:
+      labels:
+        app: user-service-bluegreen
+        color: blue
+    spec:
+      containers:
+      - name: user-service
+        image: weather-alert/user-service:blue
+        imagePullPolicy: Never
+        ports:
+        - containerPort: 8001
+        env:
+        - name: PORT
+          value: "8001"
+        - name: DEPLOY_COLOR
+          value: blue
+        - name: DB_USER
+          valueFrom:
+            secretKeyRef: {name: app-secrets, key: DB_USER}
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef: {name: app-secrets, key: DB_PASSWORD}
+        envFrom:
+        - configMapRef: {name: app-config}
+        readinessProbe:
+          httpGet: {path: /health, port: 8001}
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        resources:
+          requests: {cpu: 50m, memory: 64Mi}
+          limits: {cpu: 250m, memory: 128Mi}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: user-service-green
+  namespace: weather-alert
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: user-service-bluegreen
+      color: green
+  template:
+    metadata:
+      labels:
+        app: user-service-bluegreen
+        color: green
+    spec:
+      containers:
+      - name: user-service
+        image: weather-alert/user-service:green
+        imagePullPolicy: Never
+        ports:
+        - containerPort: 8001
+        env:
+        - name: PORT
+          value: "8001"
+        - name: DEPLOY_COLOR
+          value: green
+        - name: DB_USER
+          valueFrom:
+            secretKeyRef: {name: app-secrets, key: DB_USER}
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef: {name: app-secrets, key: DB_PASSWORD}
+        envFrom:
+        - configMapRef: {name: app-config}
+        readinessProbe:
+          httpGet: {path: /health, port: 8001}
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        resources:
+          requests: {cpu: 50m, memory: 64Mi}
+          limits: {cpu: 250m, memory: 128Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: user-service-bluegreen-router
+  namespace: weather-alert
+spec:
+  selector:
+    app: user-service-bluegreen
+    color: blue   # starts pointed at blue
+  ports:
+  - port: 8001
+    targetPort: 8001
+  type: ClusterIP
+EOF
+
+kubectl -n weather-alert rollout status deployment/user-service-blue
+kubectl -n weather-alert rollout status deployment/user-service-green
 
 # ============================================================================
-# STEP 4: Inspect Endpoints - the missing link between Service and Pods
+# STEP 3: Confirm the router currently serves BLUE only
 # ============================================================================
 
-# Healthy state: Endpoints lists one IP:port per Ready Pod
-kubectl -n weather-alert get endpoints nats
-kubectl -n weather-alert describe endpoints nats
+kubectl -n weather-alert get endpoints user-service-bluegreen-router
+# IPs shown should match ONLY the blue Pods:
+kubectl -n weather-alert get pods -l app=user-service-bluegreen,color=blue -o wide
 
-# Compare against the actual Pod IP:
-kubectl -n weather-alert get pods -l app=nats -o wide
-
-# ============================================================================
-# STEP 5: Reproduce the real incident on purpose
-# ============================================================================
-
-# Scale nats to 0 - the Service still exists, DNS still resolves,
-# but Endpoints becomes EMPTY:
-kubectl -n weather-alert scale deployment nats --replicas=0
-
-kubectl -n weather-alert get endpoints nats
-# -> <none>   (this is the "backend unreachable" state)
-
-# DNS still resolves even with zero backends - proving DNS success alone
-# doesn't mean the service is usable:
-kubectl -n weather-alert run dns-test3 --rm -it --restart=Never --image=busybox:musl -- \
-  nslookup nats
-
-# Watch alert-evaluator (and the other NATS-dependent services) react.
-# Because these services use nats.RetryOnFailedConnect + MaxReconnects(-1)
-# (see weather-alert/*/cmd/server/main.go), they log and keep retrying
-# instead of crash-looping:
-kubectl -n weather-alert logs deployment/alert-evaluator --tail=20 -f
-# Expect repeated "NATS disconnected" / reconnect attempts, no pod restarts
+kubectl -n weather-alert port-forward svc/user-service-bluegreen-router 18001:8001 &
+curl http://localhost:18001/health
+kill %1   # stop the port-forward job
 
 # ============================================================================
-# STEP 6: Recover and confirm self-healing
+# STEP 4: Cut traffic over to GREEN with a single selector flip
 # ============================================================================
 
-kubectl -n weather-alert scale deployment nats --replicas=1
+kubectl -n weather-alert patch service user-service-bluegreen-router \
+  --type merge \
+  -p '{"spec":{"selector":{"app":"user-service-bluegreen","color":"green"}}}'
 
-kubectl -n weather-alert rollout status deployment/nats
+# Endpoints repopulate INSTANTLY - no Pods were created/deleted/restarted:
+kubectl -n weather-alert get endpoints user-service-bluegreen-router
+kubectl -n weather-alert get pods -l app=user-service-bluegreen,color=green -o wide
 
-# Endpoints repopulates automatically once the new nats Pod passes readiness:
-kubectl -n weather-alert get endpoints nats
-
-# The already-running alert-evaluator Pod reconnects WITHOUT restarting -
-# watch for the ReconnectHandler's log line:
-kubectl -n weather-alert logs deployment/alert-evaluator --tail=20 -f
-# Expect: "✓ NATS connected"
-
-# Confirm no Pods actually crashed during the outage:
-kubectl -n weather-alert get pods -l app=alert-evaluator
-# RESTARTS column should still be 0 (or unchanged from before the test)
+kubectl -n weather-alert port-forward svc/user-service-bluegreen-router 18001:8001 &
+curl http://localhost:18001/health
+kill %1
 
 # ============================================================================
-# STEP 7: Verification commands
+# STEP 5: Instant rollback - flip the selector back to blue
 # ============================================================================
 
-# Full health check across every service after recovery:
-kubectl -n weather-alert get pods,svc,endpoints
+kubectl -n weather-alert patch service user-service-bluegreen-router \
+  --type merge \
+  -p '{"spec":{"selector":{"app":"user-service-bluegreen","color":"blue"}}}'
 
-# End-to-end confirmation the pipeline works again:
-kubectl -n weather-alert port-forward svc/alert-evaluator 8003:8003 &
-curl http://localhost:8003/api/v1/stats
+kubectl -n weather-alert get endpoints user-service-bluegreen-router
+# No rollout, no Pod churn - traffic is back on blue immediately
+
+# ============================================================================
+# STEP 6: Verification commands
+# ============================================================================
+
+# Confirm the Service selector's current color:
+kubectl -n weather-alert get service user-service-bluegreen-router \
+  -o jsonpath='{.spec.selector.color}{"\n"}'
+
+# Confirm both stacks are still fully up regardless of which one is "live":
+kubectl -n weather-alert get deployment user-service-blue user-service-green
+
+# Confirm the REAL user-service Deployment/Service were never touched:
+kubectl -n weather-alert get deployment user-service -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'
+kubectl -n weather-alert get service user-service -o jsonpath='{.spec.selector}{"\n"}'
 
 # ============================================================================
 # CLEANUP
 # ============================================================================
-# (Nothing to clean up - nats was scaled back to 1 in Step 6. Kill any
-# lingering port-forward background jobs from Step 7 with `kill %1` etc.)
+kubectl -n weather-alert delete deployment user-service-blue user-service-green --ignore-not-found
+kubectl -n weather-alert delete service user-service-bluegreen-router --ignore-not-found
 
 # ============================================================================
 # KEY CONCEPTS FOR CKAD EXAM
 # ============================================================================
 #
-# 1. DNS NAME FORMATS:
-#    - <service>                                  -> same namespace only
-#    - <service>.<namespace>                       -> any namespace
-#    - <service>.<namespace>.svc.cluster.local      -> fully qualified, any namespace
+# 1. A SERVICE IS JUST A LABEL SELECTOR + STABLE VIRTUAL IP:
+#    - It has no idea which Deployment "owns" the Pods it routes to
+#    - Changing .spec.selector is a Service edit, NOT a Deployment/Pod change
 #
-# 2. SERVICE TYPES (quick reference):
-#    - ClusterIP    -> internal-only, stable virtual IP (weather-alert uses this for all 4 apps + backing services)
-#    - NodePort     -> ClusterIP + exposed on every Node's IP at a static port
-#    - LoadBalancer -> NodePort + cloud provider provisions an external LB
-#    - ExternalName -> CNAME-style redirect to an external DNS name, no proxying
+# 2. BLUE/GREEN CUTOVER = ZERO POD CHURN:
+#    - kubectl patch service ... -p '{"spec":{"selector":{...}}}' is instant
+#    - Compare to a rolling update, where Pods are created/terminated over time
 #
-# 3. TROUBLESHOOTING ORDER FOR "CAN'T REACH SERVICE X":
-#    a. Does the Service exist and have the expected port?  kubectl get svc
-#    b. Does DNS resolve it?                                  nslookup <service>
-#    c. Does it have Ready Endpoints?                         kubectl get endpoints <service>
-#    d. Is the port actually open on the Pod?                 nc -zv <service> <port>
-#    e. Only then look at NetworkPolicy or application logs
+# 3. SHARED + DISTINGUISHING LABELS:
+#    - Both color variants share app=user-service-bluegreen (what humans query)
+#    - color=blue/green is what the Service's selector actually flips on
 #
-# 4. WHY RetryOnFailedConnect MATTERS IN KUBERNETES:
-#    - Deployments have NO built-in "wait for dependency" (unlike docker-compose's
-#      depends_on: condition: service_healthy)
-#    - A Pod that crash-loops on first connection failure fights a race against
-#      its dependencies every single restart
-#    - Client-side retry/reconnect logic is the standard fix, not manifest ordering
+# 4. TWO FULL DEPLOYMENTS RUNNING AT ONCE = 2x RESOURCE COST:
+#    - This is the real trade-off vs a rolling update - budget for it
 #
 # ============================================================================
 # TROUBLESHOOTING
 # ============================================================================
 #
-# If nslookup fails entirely (not just empty Endpoints):
-# - Check CoreDNS is running: kubectl -n kube-system get pods -l k8s-app=kube-dns
-# - Confirm the Pod's dnsPolicy wasn't overridden to something unusual
+# If curl returns nothing after the selector flip:
+# - Confirm the target color's Pods are actually Ready:
+#   kubectl -n weather-alert get pods -l app=user-service-bluegreen,color=green
+# - kubectl -n weather-alert get endpoints user-service-bluegreen-router
+#   should list their IPs - empty Endpoints means no Ready Pods match yet
 #
-# If Endpoints stays empty after scaling back up:
-# - Check the new Pod's readinessProbe is actually passing:
-#   kubectl -n weather-alert describe pod -l app=nats
-# - A Pod stuck NotReady never gets added to Endpoints, by design
-#
-# If a dependent service still logs connection errors after nats recovers:
-# - Check ReconnectWait/MaxReconnects settings - client may still be backing off
-# - Confirm you're tailing logs from the CURRENT pod, not a stale one:
-#   kubectl -n weather-alert get pods -l app=alert-evaluator
+# If both curls (blue and green) return the same thing:
+# - Expected here - blue and green run the SAME real binary/tag content in
+#   this lab (only the color label/env var differs), to isolate the
+#   Service-selector mechanic from needing two genuinely different app builds
 #
 # ============================================================================
 # EXAM TIPS:
-# - `kubectl run <name> --rm -it --restart=Never --image=busybox:musl -- <cmd>` is the
-#   fastest disposable debug-pod pattern - no manifest needed, auto-deleted on exit
-# - Endpoints (or EndpointSlice on newer clusters) is the single most useful object
-#   for "is this Service actually backed by anything right now"
-# - DNS resolving successfully is NOT proof a Service is usable - always check Endpoints too
+# - `kubectl patch service <name> --type merge -p '{"spec":{"selector":{...}}}'`
+#   is the fastest imperative way to flip a Service's target
+# - There is no `kubectl set selector` subcommand - patch or edit are the options
+# - Endpoints updates are near-instant once you patch the selector - no
+#   readiness-gated rollout like a Deployment update
+# - Keep both Deployments' replica counts equal to actual traffic needs -
+#   blue/green doubles your resource footprint for as long as both are live

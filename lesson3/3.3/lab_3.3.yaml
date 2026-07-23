@@ -1,0 +1,215 @@
+# Lab 3.3 — ServiceAccount & RBAC
+# Duration: ~60 min | CKAD domain: Application Environment, Configuration & Security (25%)
+# Create a ServiceAccount, Role, and RoleBinding
+# Have a Pod use its own ServiceAccount token to list Pods in the namespace
+# via the Kubernetes API
+# Uses the real weather-alert namespace and its actual running Pods as the
+# thing being listed - not a toy namespace
+
+# ============================================================================
+# PREREQUISITE
+# ============================================================================
+# Requires the weather-alert namespace + backing services already deployed
+# (postgres:15-alpine is reused here as the debug/API-client image, same as
+# lesson1/1.3's Jobs - already pulled into minikube for this project).
+# Verify: kubectl -n weather-alert get pods
+
+# ============================================================================
+# DETAILED EXPLANATION
+# ============================================================================
+#
+# THE RBAC OBJECT CHAIN
+#
+#    ServiceAccount (WHO - an identity a Pod runs as)
+#         |
+#         v  bound via
+#    RoleBinding (grants a Role's permissions TO a specific subject)
+#         |
+#         v  references
+#    Role (WHAT - a set of allowed verbs on specific resources, one namespace only)
+#
+#    - Role/RoleBinding are NAMESPACE-scoped (this lab's case)
+#    - ClusterRole/ClusterRoleBinding are the cluster-wide equivalents -
+#      use those only when access must span namespaces
+#
+# HOW A POD ACTUALLY USES ITS SERVICEACCOUNT
+#    - Every Pod runs as SOME ServiceAccount (the namespace's "default" one
+#      if you don't set spec.serviceAccountName)
+#    - Kubernetes auto-mounts a token for that ServiceAccount at
+#      /var/run/secrets/kubernetes.io/serviceaccount/{token,ca.crt,namespace}
+#    - Any process inside the Pod can present that token as a Bearer token
+#      to the API server (reachable in-cluster at https://kubernetes.default.svc)
+#      to authenticate AS that ServiceAccount
+#    - RBAC then decides what that identity is ALLOWED to do - having a
+#      valid token only proves WHO you are, not what you can do
+#
+# WHY THE DEFAULT SERVICEACCOUNT USUALLY CAN'T DO ANYTHING
+#    - A namespace's "default" ServiceAccount has NO Role bound to it out of
+#      the box - it can authenticate, but every API call gets 403 Forbidden
+#      until you explicitly grant permissions, which is exactly the point:
+#      least-privilege by default
+#
+# ============================================================================
+
+# ============================================================================
+# STEP 1: Create the ServiceAccount, Role, and RoleBinding
+# ============================================================================
+
+kubectl -n weather-alert create serviceaccount pod-lister-sa
+
+kubectl -n weather-alert apply -f - <<'EOF'
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: pod-lister-role
+  namespace: weather-alert
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: pod-lister-binding
+  namespace: weather-alert
+subjects:
+- kind: ServiceAccount
+  name: pod-lister-sa
+  namespace: weather-alert
+roleRef:
+  kind: Role
+  name: pod-lister-role
+  apiGroup: rbac.authorization.k8s.io
+EOF
+
+# ============================================================================
+# STEP 2: Sanity-check permissions BEFORE running any Pod (no cluster
+# contact needed from inside a container for this check)
+# ============================================================================
+
+# The ServiceAccount we just granted access to:
+kubectl auth can-i list pods \
+  --as=system:serviceaccount:weather-alert:pod-lister-sa -n weather-alert
+# Expect: yes
+
+# Contrast - the namespace's default ServiceAccount (nothing bound to it):
+kubectl auth can-i list pods \
+  --as=system:serviceaccount:weather-alert:default -n weather-alert
+# Expect: no
+
+# Contrast - the granted SA has NO write access (Role only allows get/list):
+kubectl auth can-i delete pods \
+  --as=system:serviceaccount:weather-alert:pod-lister-sa -n weather-alert
+# Expect: no
+
+# ============================================================================
+# STEP 3: A real Pod, running AS pod-lister-sa, calls the API with its own
+# mounted token
+# ============================================================================
+
+kubectl -n weather-alert apply -f - <<'EOF'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: rbac-demo-pod
+  namespace: weather-alert
+  labels:
+    app: rbac-demo-pod
+spec:
+  serviceAccountName: pod-lister-sa
+  containers:
+  - name: api-client
+    image: postgres:15-alpine
+    imagePullPolicy: IfNotPresent
+    command: ["sleep", "3600"]
+    resources:
+      requests: {cpu: 25m, memory: 32Mi}
+      limits: {cpu: 100m, memory: 64Mi}
+EOF
+
+kubectl -n weather-alert wait --for=condition=Ready pod/rbac-demo-pod --timeout=60s
+
+# Call the real API server FROM INSIDE the Pod, using its own auto-mounted token:
+kubectl -n weather-alert exec rbac-demo-pod -- /bin/sh -c '
+  TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+  wget --no-check-certificate --header="Authorization: Bearer $TOKEN" \
+    -qO- https://kubernetes.default.svc/api/v1/namespaces/weather-alert/pods
+' | head -c 300
+echo ""
+# Expect real JSON starting with "kind":"PodList", listing the ACTUAL Pods
+# running in this namespace right now
+
+# ============================================================================
+# STEP 4: Verification commands
+# ============================================================================
+
+kubectl get role pod-lister-role -n weather-alert -o jsonpath='{.rules}'
+echo ""
+kubectl get rolebinding pod-lister-binding -n weather-alert \
+  -o jsonpath='{.subjects[0].name}{" -> "}{.roleRef.name}{"\n"}'
+
+# Confirm the SAME Pod, using the SAME token, is denied a RESOURCE it was
+# never granted (secrets) - a plain GET, so it works with busybox wget
+# without relying on less-portable HTTP-method flags:
+kubectl -n weather-alert exec rbac-demo-pod -- /bin/sh -c '
+  TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+  wget --no-check-certificate --header="Authorization: Bearer $TOKEN" \
+    -qO- https://kubernetes.default.svc/api/v1/namespaces/weather-alert/secrets 2>&1 || true
+'
+# Expect a 403 Forbidden body - the Role only grants get/list on pods, nothing on secrets
+
+# ============================================================================
+# CLEANUP
+# ============================================================================
+kubectl -n weather-alert delete pod rbac-demo-pod --ignore-not-found
+kubectl -n weather-alert delete rolebinding pod-lister-binding --ignore-not-found
+kubectl -n weather-alert delete role pod-lister-role --ignore-not-found
+kubectl -n weather-alert delete serviceaccount pod-lister-sa --ignore-not-found
+
+# ============================================================================
+# KEY CONCEPTS FOR CKAD EXAM
+# ============================================================================
+#
+# 1. THE 3-OBJECT CHAIN: ServiceAccount -> RoleBinding -> Role
+#    - Role/RoleBinding: namespace-scoped
+#    - ClusterRole/ClusterRoleBinding: cluster-scoped (use sparingly)
+#
+# 2. `kubectl auth can-i --as=system:serviceaccount:<ns>:<sa>`:
+#    - Checks permissions WITHOUT needing to launch a Pod - the single
+#      fastest way to verify/debug RBAC on the exam
+#
+# 3. TOKEN LOCATION INSIDE ANY POD:
+#    /var/run/secrets/kubernetes.io/serviceaccount/{token,ca.crt,namespace}
+#    - Auto-mounted for whichever ServiceAccount the Pod runs as (default if
+#      spec.serviceAccountName is unset)
+#
+# 4. IN-CLUSTER API ENDPOINT:
+#    https://kubernetes.default.svc (or https://kubernetes.default.svc.cluster.local)
+#    - Always resolvable from any namespace, same idea as lesson2/2.2's DNS lab
+#
+# ============================================================================
+# TROUBLESHOOTING
+# ============================================================================
+#
+# If `kubectl auth can-i` for pod-lister-sa returns "no" unexpectedly:
+# - Confirm the RoleBinding's subjects[].namespace matches the ServiceAccount's
+#   actual namespace exactly - a mismatch here silently grants nothing
+#
+# If the in-Pod wget gets "Forbidden" even for GET /pods:
+# - Confirm spec.serviceAccountName on the Pod is exactly "pod-lister-sa",
+#   not left as the default - kubectl describe pod rbac-demo-pod shows which
+#   SA it's actually running as
+#
+# If wget can't even connect to kubernetes.default.svc:
+# - Confirm CoreDNS is healthy (same troubleshooting order as lesson2/2.2) -
+#   this is a real Service, subject to the exact same DNS/Endpoints checks
+#
+# ============================================================================
+# EXAM TIPS:
+# - `kubectl auth can-i ... --as=system:serviceaccount:<ns>:<name>` is faster
+#   than writing a test Pod every time you need to check a permission
+# - Role/RoleBinding names don't need to match the ServiceAccount name - the
+#   binding is what connects them, not naming convention
+# - Forgetting spec.serviceAccountName on the Pod is the single most common
+#   reason "my RBAC isn't working" - it silently falls back to "default"

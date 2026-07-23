@@ -1,0 +1,256 @@
+# Lab 3.2 — Security Context Lockdown
+# Duration: ~45 min | CKAD domain: Application Environment, Configuration & Security (25%)
+# Run a Pod as non-root with a read-only root filesystem
+# Drop ALL capabilities; disable privilege escalation
+# Uses the real weather-alert/user-service image - not a generic
+# nginx/busybox placeholder
+#
+# THIS LAB'S PATTERN HITS A REAL PROBLEM: user-service's Dockerfile (like all
+# 4 weather-alert services) does `WORKDIR /root/` with no USER directive, so
+# the binary lives at /root/app, a directory only root can traverse. Locking
+# the Pod down to non-root WITHOUT fixing this fails for real - a genuine,
+# not-contrived example of "the image wasn't built with non-root in mind."
+
+# ============================================================================
+# PREREQUISITE
+# ============================================================================
+# Requires the weather-alert namespace + user-service image already built
+# into minikube's Docker daemon (see weather-alert/README.md "Deploy to
+# Minikube"). This lab's Pods are standalone - nothing here touches the real
+# user-service Deployment.
+
+# ============================================================================
+# DETAILED EXPLANATION
+# ============================================================================
+#
+# THE 4 LOCKDOWN SETTINGS THIS LAB APPLIES:
+#    runAsNonRoot: true              -> kubelet REFUSES to start the container
+#                                        if it would run as UID 0, even if you
+#                                        never set runAsUser explicitly
+#    runAsUser: 1000                 -> force a specific non-root UID
+#    readOnlyRootFilesystem: true    -> container's root fs is mounted read-only;
+#                                        only explicitly mounted volumes are writable
+#    allowPrivilegeEscalation: false -> blocks setuid-style privilege gain
+#                                        (e.g. via setuid binaries) inside the container
+#    capabilities.drop: ["ALL"]      -> strips every Linux capability (NET_RAW,
+#                                        CHOWN, etc.) the container process would
+#                                        otherwise inherit from the container runtime
+#
+# WHY THE NAIVE ATTEMPT FAILS (a real, not contrived, gotcha):
+#    user-service/Dockerfile:
+#        WORKDIR /root/
+#        COPY --from=builder /build/app .
+#        CMD ["./app"]
+#    - The final image never creates a non-root user - the binary sits in
+#      /root/app, and /root/ is only traversable by UID 0 (mode 0700)
+#    - Setting runAsUser: 1000 on this image AS-IS means the container can't
+#      even exec /root/app - "permission denied", CrashLoopBackOff
+#    - This is exactly why real hardening work often needs an image change,
+#      not just a Pod-level securityContext - but you can ALSO work around
+#      it at the Pod level without touching the Dockerfile, using an init
+#      container to stage the binary somewhere world-executable (Step 3)
+#
+# ============================================================================
+
+# ============================================================================
+# STEP 1: The naive attempt - watch it fail for real
+# ============================================================================
+
+kubectl -n weather-alert apply -f - <<'EOF'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: user-service-naive-lockdown
+  namespace: weather-alert
+  labels:
+    app: user-service-naive-lockdown
+spec:
+  containers:
+  - name: user-service
+    image: weather-alert/user-service:latest
+    imagePullPolicy: Never
+    securityContext:
+      runAsNonRoot: true
+      runAsUser: 1000
+      readOnlyRootFilesystem: true
+      allowPrivilegeEscalation: false
+      capabilities:
+        drop: ["ALL"]
+    env:
+    - name: PORT
+      value: "8001"
+    - name: DB_USER
+      valueFrom:
+        secretKeyRef: {name: app-secrets, key: DB_USER}
+    - name: DB_PASSWORD
+      valueFrom:
+        secretKeyRef: {name: app-secrets, key: DB_PASSWORD}
+    envFrom:
+    - configMapRef: {name: app-config}
+    resources:
+      requests: {cpu: 50m, memory: 64Mi}
+      limits: {cpu: 250m, memory: 128Mi}
+EOF
+
+sleep 15
+kubectl -n weather-alert get pod user-service-naive-lockdown
+# Expect CrashLoopBackOff / Error - NOT Running
+kubectl -n weather-alert logs user-service-naive-lockdown
+# Expect something like "exec: permission denied" or "exec format error"/"no such file or directory"
+# depending on the container runtime - either way, it never becomes Ready
+
+# ============================================================================
+# STEP 2: Understand why (see DETAILED EXPLANATION) - the image's own
+# WORKDIR /root/ is the blocker, not Kubernetes
+# ============================================================================
+
+# ============================================================================
+# STEP 3: The fix - init container stages the binary into a shared,
+# world-executable emptyDir; the main container runs it from there instead
+# of from inside /root/
+# ============================================================================
+
+kubectl -n weather-alert apply -f - <<'EOF'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: user-service-locked-down
+  namespace: weather-alert
+  labels:
+    app: user-service-locked-down
+spec:
+  volumes:
+  - name: app-bin
+    emptyDir: {}
+  initContainers:
+  # Runs as root (the ONLY container in this Pod that does) purely to copy
+  # a file out of a root-owned directory - it never serves traffic.
+  - name: stage-binary
+    image: weather-alert/user-service:latest
+    imagePullPolicy: Never
+    command: ["/bin/sh", "-c", "cp /root/app /staged/app && chmod 755 /staged/app"]
+    volumeMounts:
+    - name: app-bin
+      mountPath: /staged
+  containers:
+  - name: user-service
+    image: weather-alert/user-service:latest
+    imagePullPolicy: Never
+    command: ["/app/app"]
+    securityContext:
+      runAsNonRoot: true
+      runAsUser: 1000
+      readOnlyRootFilesystem: true
+      allowPrivilegeEscalation: false
+      capabilities:
+        drop: ["ALL"]
+    ports:
+    - containerPort: 8001
+    env:
+    - name: PORT
+      value: "8001"
+    - name: DB_USER
+      valueFrom:
+        secretKeyRef: {name: app-secrets, key: DB_USER}
+    - name: DB_PASSWORD
+      valueFrom:
+        secretKeyRef: {name: app-secrets, key: DB_PASSWORD}
+    envFrom:
+    - configMapRef: {name: app-config}
+    volumeMounts:
+    - name: app-bin
+      mountPath: /app
+      readOnly: true
+    readinessProbe:
+      httpGet: {path: /health, port: 8001}
+      initialDelaySeconds: 5
+      periodSeconds: 10
+    resources:
+      requests: {cpu: 50m, memory: 64Mi}
+      limits: {cpu: 250m, memory: 128Mi}
+EOF
+
+kubectl -n weather-alert wait --for=condition=Ready pod/user-service-locked-down --timeout=60s
+
+# ============================================================================
+# STEP 4: Verification commands
+# ============================================================================
+
+# Confirm it's Running/Ready this time:
+kubectl -n weather-alert get pod user-service-locked-down
+
+# Confirm the process is actually non-root:
+kubectl -n weather-alert exec user-service-locked-down -- id
+# Expect: uid=1000 gid=0(root) ... - NOT uid=0
+
+# Confirm the root filesystem is genuinely read-only:
+kubectl -n weather-alert exec user-service-locked-down -- sh -c "touch /test-write 2>&1 || true"
+# Expect: "Read-only file system" (the shell here is a debug exec, the
+# container itself has no shell in its normal CMD - this exec just proves
+# the mount is enforced)
+
+# Confirm the app actually still works end-to-end:
+kubectl -n weather-alert exec user-service-locked-down -- wget -qO- http://localhost:8001/health
+
+# Confirm capabilities were actually dropped:
+kubectl -n weather-alert get pod user-service-locked-down \
+  -o jsonpath='{.spec.containers[0].securityContext.capabilities.drop}'
+echo ""
+
+# ============================================================================
+# CLEANUP
+# ============================================================================
+kubectl -n weather-alert delete pod user-service-naive-lockdown user-service-locked-down --ignore-not-found
+
+# ============================================================================
+# KEY CONCEPTS FOR CKAD EXAM
+# ============================================================================
+#
+# 1. POD-LEVEL vs CONTAINER-LEVEL securityContext:
+#    - spec.securityContext        -> applies to ALL containers in the Pod
+#    - spec.containers[].securityContext -> overrides for ONE container
+#    - Container-level always wins when both set the same field
+#
+# 2. runAsNonRoot IS A GUARD, NOT A UID PICKER:
+#    - It just refuses to start if the EFFECTIVE UID would be 0
+#    - You still need runAsUser: <N> to pick which non-root UID actually runs
+#
+# 3. readOnlyRootFilesystem BREAKS ANY APP THAT WRITES TO ITS OWN IMAGE FS:
+#    - Logs to stdout/stderr are fine (that's not the filesystem)
+#    - Temp files, caches, or writable config need an explicit emptyDir
+#      volume mounted at that specific path
+#
+# 4. INIT CONTAINERS CAN FIX PERMISSION PROBLEMS WITHOUT REBUILDING THE IMAGE:
+#    - Copy-and-chmod into a shared emptyDir is a real, common workaround
+#      when you can't or don't want to change the Dockerfile
+#
+# ============================================================================
+# TROUBLESHOOTING
+# ============================================================================
+#
+# If user-service-naive-lockdown actually starts successfully for you:
+# - Your container runtime/base image may differ from what this lab assumes -
+#   check `kubectl -n weather-alert exec user-service-naive-lockdown -- id`
+#   to see what UID is actually running
+#
+# If user-service-locked-down still fails after the init-container fix:
+# - Confirm the init container actually completed:
+#   kubectl -n weather-alert logs user-service-locked-down -c stage-binary
+# - Confirm the emptyDir permissions allow exec by a non-owning UID:
+#   emptyDir defaults to world-writable; `chmod 755` on the binary itself is
+#   what actually matters here
+#
+# If readinessProbe never passes:
+# - The Go binary is statically linked (CGO_ENABLED=0) so it shouldn't need
+#   any shared libraries missing under a restricted root fs - if this still
+#   fails, exec in and check `wget -qO- http://localhost:8001/health` directly
+#
+# ============================================================================
+# EXAM TIPS:
+# - Memorize the 5 field names cold: runAsNonRoot, runAsUser,
+#   readOnlyRootFilesystem, allowPrivilegeEscalation, capabilities.drop
+# - "Drop ALL capabilities" is written as capabilities: {drop: ["ALL"]} -
+#   the string "ALL" is special-cased, not a real Linux capability name
+# - A Pod that immediately CrashLoopBackOffs right after adding
+#   securityContext is one of the most common exam/production security
+#   hardening symptoms - check `kubectl logs` for a permission error first

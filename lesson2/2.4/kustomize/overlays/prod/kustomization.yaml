@@ -1,0 +1,17 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base
+
+# Same base Deployment/Service - only these two values differ per environment
+replicas:
+  - name: user-service-demo
+    count: 4
+
+images:
+  - name: weather-alert/user-service
+    newTag: v2
+
+commonLabels:
+  env: prod
